@@ -1,9 +1,8 @@
-use std::collections::HashMap;
-
 use steel_utils::{BlockStateId, ResourceLocation};
 
 use crate::blocks::behaviour::BlockBehaviourProperties;
 use crate::blocks::properties::{DynProperty, Property};
+use crate::registry::{Registrable, Registry};
 
 #[derive(Debug)]
 pub struct Block {
@@ -62,11 +61,15 @@ impl Block {
 
 pub type BlockRef = &'static Block;
 
+impl Registrable for Block {
+    fn key(&self) -> &ResourceLocation {
+        &self.key
+    }
+}
+
 // The central registry for all blocks.
 pub struct BlockRegistry {
-    blocks_by_id: Vec<BlockRef>,
-    blocks_by_key: HashMap<ResourceLocation, usize>,
-    allows_registering: bool,
+    registry: Registry<Block>,
     pub state_to_block_lookup: Vec<BlockRef>,
     /// Maps state IDs to block IDs (parallel to state_to_block_lookup for O(1) lookup)
     pub state_to_block_id: Vec<usize>,
@@ -86,9 +89,7 @@ impl BlockRegistry {
     // Creates a new, empty registry.
     pub fn new() -> Self {
         Self {
-            blocks_by_id: Vec::new(),
-            blocks_by_key: HashMap::new(),
-            allows_registering: true,
+            registry: Registry::new(),
             state_to_block_lookup: Vec::new(),
             state_to_block_id: Vec::new(),
             block_to_base_state: Vec::new(),
@@ -98,20 +99,14 @@ impl BlockRegistry {
 
     // Prevents the registry from registering new blocks.
     pub fn freeze(&mut self) {
-        self.allows_registering = false;
+        self.registry.freeze();
     }
 
     // Registers a new block.
     pub fn register(&mut self, block: BlockRef) -> usize {
-        if !self.allows_registering {
-            panic!("Cannot register blocks after the registry has been frozen");
-        }
-
-        let id = self.blocks_by_id.len();
+        let id = self.registry.register(block);
         let base_state_id = self.next_state_id;
 
-        self.blocks_by_key.insert(block.key.clone(), id);
-        self.blocks_by_id.push(block);
         self.block_to_base_state.push(base_state_id);
 
         let mut state_count = 1;
@@ -141,11 +136,11 @@ impl BlockRegistry {
 
     // Retrieves a block by its ID.
     pub fn by_id(&self, id: usize) -> Option<BlockRef> {
-        self.blocks_by_id.get(id).copied()
+        self.registry.by_id(id)
     }
 
     pub fn get_id(&self, block: BlockRef) -> &usize {
-        self.blocks_by_key.get(&block.key).expect("Block not found")
+        self.registry.get_id(block)
     }
 
     pub fn by_state_id(&self, state_id: BlockStateId) -> Option<BlockRef> {
@@ -154,7 +149,7 @@ impl BlockRegistry {
 
     // Retrieves a block by its name.
     pub fn by_key(&self, key: &ResourceLocation) -> Option<BlockRef> {
-        self.blocks_by_key.get(key).and_then(|id| self.by_id(*id))
+        self.registry.by_key(key)
     }
 
     pub fn get_properties(&self, id: BlockStateId) -> Vec<(&str, &str)> {

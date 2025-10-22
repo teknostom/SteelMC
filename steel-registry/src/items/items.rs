@@ -1,8 +1,6 @@
-use std::collections::HashMap;
-
 use steel_utils::ResourceLocation;
 
-use crate::{blocks::blocks::BlockRef, data_components::DataComponentMap};
+use crate::{blocks::blocks::BlockRef, data_components::DataComponentMap, registry::{Registrable, Registry}};
 
 #[derive(Debug)]
 pub struct Item {
@@ -28,10 +26,14 @@ impl Item {
 
 pub type ItemRef = &'static Item;
 
+impl Registrable for Item {
+    fn key(&self) -> &ResourceLocation {
+        &self.key
+    }
+}
+
 pub struct ItemRegistry {
-    items_by_id: Vec<ItemRef>,
-    items_by_key: HashMap<ResourceLocation, usize>,
-    allows_registering: bool,
+    registry: Registry<Item>,
 }
 
 impl Default for ItemRegistry {
@@ -43,37 +45,27 @@ impl Default for ItemRegistry {
 impl ItemRegistry {
     pub fn new() -> Self {
         Self {
-            items_by_id: Vec::new(),
-            items_by_key: HashMap::new(),
-            allows_registering: true,
+            registry: Registry::new(),
         }
     }
 
     pub fn freeze(&mut self) {
-        self.allows_registering = false;
+        self.registry.freeze();
     }
 
     pub fn register(&mut self, item: ItemRef) -> usize {
-        if !self.allows_registering {
-            panic!("Cannot register items after the registry has been frozen");
-        }
-
-        let id = self.items_by_id.len();
-        self.items_by_key.insert(item.key.clone(), id);
-        self.items_by_id.push(item);
-
-        id
+        self.registry.register(item)
     }
 
     pub fn by_id(&self, id: usize) -> Option<ItemRef> {
-        self.items_by_id.get(id).copied()
+        self.registry.by_id(id)
     }
 
     pub fn get_id(&self, item: ItemRef) -> &usize {
-        self.items_by_key.get(&item.key).expect("Item not found")
+        self.registry.get_id(item)
     }
 
     pub fn by_key(&self, key: &ResourceLocation) -> Option<ItemRef> {
-        self.items_by_key.get(key).and_then(|id| self.by_id(*id))
+        self.registry.by_key(key)
     }
 }

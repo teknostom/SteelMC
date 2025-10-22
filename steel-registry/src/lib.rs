@@ -9,6 +9,7 @@
 pub mod blocks;
 pub mod data_components;
 pub mod items;
+pub mod registry;
 
 //#[rustfmt::skip]
 #[path = "generated/vanilla_blocks.rs"]
