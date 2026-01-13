@@ -52,7 +52,15 @@ impl World {
             log::warn!("Player tick slow: {player_tick_elapsed:?}");
         }
 
-        // Update entity tracking (player visibility)
+        // Tick entity behaviors (AI, movement, etc.)
+        let entity_tick_start = tokio::time::Instant::now();
+        self.entity_tracker.tick_entities(tick_count, &self.chunk_map);
+        let entity_tick_elapsed = entity_tick_start.elapsed();
+        if entity_tick_elapsed >= Duration::from_millis(50) {
+            log::warn!("Entity behavior tick slow: {entity_tick_elapsed:?}");
+        }
+
+        // Update entity tracking (player visibility and sync changes)
         let entity_start = tokio::time::Instant::now();
         let mut players = Vec::new();
         self.players.iter_sync(|_, p| {

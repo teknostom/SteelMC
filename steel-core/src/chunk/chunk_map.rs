@@ -432,4 +432,47 @@ impl ChunkMap {
 
         Ok(saved_count)
     }
+
+    /// Gets the block state at a world position.
+    ///
+    /// Returns `None` if the chunk is not loaded or the position is out of bounds.
+    /// The y coordinate is in world space (-64 to 319 for overworld).
+    #[must_use]
+    pub fn get_block_state(&self, x: i32, y: i32, z: i32) -> Option<steel_utils::BlockStateId> {
+        // Convert to chunk coordinates
+        let chunk_x = x >> 4;
+        let chunk_z = z >> 4;
+        let chunk_pos = ChunkPos::new(chunk_x, chunk_z);
+
+        // Get the chunk holder
+        let holder = self.chunks.read_sync(&chunk_pos, |_, h| h.clone())?;
+
+        // Get the full chunk data
+        let chunk_guard = holder.try_chunk(ChunkStatus::Full)?;
+        let chunk_access = chunk_guard.as_ref()?;
+
+        // Convert to relative coordinates within chunk
+        let rel_x = (x & 15) as usize;
+        let rel_z = (z & 15) as usize;
+
+        // Convert y to section-relative (world bottom is -64)
+        // Section y = (world_y + 64) for overworld
+        let rel_y = (y + 64) as usize;
+
+        chunk_access.get_relative_block(rel_x, rel_y, rel_z)
+    }
+
+    /// Checks if a block at the given world position is solid (non-air, non-passable).
+    ///
+    /// Returns `true` if the block is solid, `false` if air/passable or chunk not loaded.
+    #[must_use]
+    pub fn is_block_solid(&self, x: i32, y: i32, z: i32) -> bool {
+        if let Some(state_id) = self.get_block_state(x, y, z) {
+            // Air has state ID 0
+            state_id.0 != 0
+        } else {
+            // Treat unloaded chunks as solid (safe default)
+            true
+        }
+    }
 }

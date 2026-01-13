@@ -5,14 +5,18 @@
 
 mod display;
 mod slime;
+mod zombie;
 
 pub use display::{DISPLAY_BEHAVIOUR, DisplayBehaviour};
 pub use slime::{SLIME_BEHAVIOUR, SlimeBehaviour};
+pub use zombie::{ZOMBIE_BEHAVIOUR, ZombieBehaviour};
 
 use simdnbt::owned::{NbtCompound, NbtTag};
 use steel_registry::REGISTRY;
 use steel_utils::Identifier;
 
+use crate::chunk::chunk_map::ChunkMap;
+use super::entity_tracker::EntityTracker;
 use super::EntityData;
 
 // =============================================================================
@@ -83,7 +87,7 @@ pub fn parse_block_state(block_state: &NbtCompound) -> Option<i32> {
 /// Each entity type can have a behaviour that defines:
 /// - Entity data fields (synched to client)
 /// - NBT reading/writing
-/// - Future: tick behaviour, AI, etc.
+/// - Tick behaviour (AI, etc.)
 ///
 /// Behaviours are looked up from the registry by `entity_type_id`.
 pub trait EntityBehaviour: Send + Sync {
@@ -97,6 +101,45 @@ pub trait EntityBehaviour: Send + Sync {
 
     /// Write entity-type-specific NBT.
     fn write_nbt(&self, _data: &EntityData, _nbt: &mut NbtCompound) {}
+
+    /// Called every game tick to update entity-specific behavior.
+    ///
+    /// This is where AI goals are ticked, movement is processed, etc.
+    /// The context provides access to the mob's position, rotation, and AI state.
+    fn tick(&self, _ctx: &mut EntityTickContext<'_>) {}
+
+    /// Returns true if this behaviour has a custom tick implementation.
+    ///
+    /// If false, the entity tracker can skip ticking this entity for performance.
+    fn has_tick(&self) -> bool {
+        false
+    }
+}
+
+/// Context passed to entity behaviours during tick.
+pub struct EntityTickContext<'a> {
+    /// The entity ID
+    pub entity_id: i32,
+    /// The entity type ID
+    pub entity_type_id: i32,
+    /// Current position (mutable)
+    pub position: &'a mut steel_utils::math::Vector3<f64>,
+    /// Current rotation (yaw, pitch) (mutable)
+    pub rotation: &'a mut (f32, f32),
+    /// Current velocity (mutable)
+    pub velocity: &'a mut steel_utils::math::Vector3<f64>,
+    /// Entity data for synced fields (uses interior mutability)
+    pub entity_data: &'a EntityData,
+    /// Current game tick
+    pub tick: u64,
+    /// Random number generator
+    pub random: &'a mut rand::rngs::StdRng,
+    /// AI state (for mobs with AI)
+    pub ai_state: Option<&'a mut super::ai::AiState>,
+    /// Entity tracker for querying nearby entities
+    pub entity_tracker: &'a EntityTracker,
+    /// Chunk map for block queries (pathfinding)
+    pub chunk_map: &'a ChunkMap,
 }
 
 // =============================================================================

@@ -1,10 +1,14 @@
 //! Generic mob entity
 
+use rand::SeedableRng;
 use simdnbt::owned::{NbtCompound, NbtList, NbtTag};
+use steel_utils::locks::SyncMutex;
 use steel_utils::math::Vector3;
 use uuid::Uuid;
 
+use super::ai::goal::AiState;
 use super::behaviour::nbt_bool;
+use super::behaviour::EntityTickContext;
 use super::behaviour_registry::get_behaviour_registry;
 use super::{BaseEntity, Entity, EntityData, EntityDataAccessor};
 
@@ -35,6 +39,10 @@ fn nbt_rotation(nbt: &NbtCompound, key: &str) -> Option<(f32, f32)> {
 /// behaviour registry.
 pub struct MobEntity {
     base: BaseEntity,
+    /// Random number generator for this entity's AI
+    random: SyncMutex<rand::rngs::StdRng>,
+    /// AI state for entities with behaviours
+    ai_state: SyncMutex<AiState>,
 }
 
 impl MobEntity {
@@ -49,7 +57,11 @@ impl MobEntity {
             .get_behavior(entity_type_id)
             .define_entity_data(&mut base.entity_data);
 
-        Self { base }
+        Self {
+            base,
+            random: SyncMutex::new(rand::rngs::StdRng::from_rng(&mut rand::rng())),
+            ai_state: SyncMutex::new(AiState::default()),
+        }
     }
 
     /// Creates a new `MobEntity` with NBT data applied.
@@ -173,5 +185,70 @@ impl Entity for MobEntity {
 
     fn entity_data(&self) -> &EntityData {
         self.base.entity_data()
+    }
+
+    fn tick(
+        &self,
+        tick_count: u64,
+        entity_tracker: &super::EntityTracker,
+        chunk_map: &crate::chunk::chunk_map::ChunkMap,
+    ) {
+        let behaviour = get_behaviour_registry().get_behavior(self.base.entity_type_id);
+
+        // Skip if behaviour doesn't have custom tick
+        if !behaviour.has_tick() {
+            return;
+        }
+
+        // Get mutable access to entity state
+        let mut position = self.base.position.lock();
+        let mut rotation = self.base.rotation.lock();
+        let mut velocity = self.base.delta_movement.lock();
+        let mut random = self.random.lock();
+        let mut ai_state = self.ai_state.lock();
+
+        // Create tick context with mutable references
+        let mut ctx = EntityTickContext {
+            entity_id: self.base.entity_id(),
+            entity_type_id: self.base.entity_type_id,
+            position: &mut position,
+            rotation: &mut rotation,
+            velocity: &mut velocity,
+            entity_data: &self.base.entity_data,
+            tick: tick_count,
+            random: &mut random,
+            ai_state: Some(&mut ai_state),
+            entity_tracker,
+            chunk_map,
+        };
+
+        // Call behaviour tick
+        behaviour.tick(&mut ctx);
+
+        // Apply velocity to position (basic physics)
+        if velocity.x != 0.0 || velocity.y != 0.0 || velocity.z != 0.0 {
+            position.x += velocity.x;
+            position.y += velocity.y;
+            position.z += velocity.z;
+
+            // Apply friction/drag (simplified)
+            velocity.x *= 0.91;
+            velocity.y *= 0.98; // Less drag on Y for gravity
+            velocity.z *= 0.91;
+
+            // Zero out very small velocities
+            if velocity.x.abs() < 0.003 {
+                velocity.x = 0.0;
+            }
+            if velocity.z.abs() < 0.003 {
+                velocity.z = 0.0;
+            }
+        }
+    }
+
+    fn has_tick(&self) -> bool {
+        get_behaviour_registry()
+            .get_behavior(self.base.entity_type_id)
+            .has_tick()
     }
 }

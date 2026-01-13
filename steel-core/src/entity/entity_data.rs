@@ -534,6 +534,9 @@ impl EntityDataAccessor<i32> {
 
     /// Slime/Magma cube size (index 16 in Mob entity hierarchy)
     pub const SLIME_SIZE: Self = Self::new(16);
+
+    /// Zombie: special type (index 17, unused in modern versions)
+    pub const ZOMBIE_SPECIAL_TYPE: Self = Self::new(17);
 }
 
 impl EntityDataAccessor<Option<String>> {
@@ -550,6 +553,12 @@ impl EntityDataAccessor<bool> {
 
     /// Whether entity has no gravity
     pub const NO_GRAVITY: Self = Self::new(5);
+
+    /// Zombie: whether it's a baby zombie (index 16 in Zombie entity hierarchy)
+    pub const ZOMBIE_IS_BABY: Self = Self::new(16);
+
+    /// Zombie: whether it's converting to drowned (index 18)
+    pub const ZOMBIE_DROWNED_CONVERSION: Self = Self::new(18);
 }
 
 impl EntityDataAccessor<Pose> {

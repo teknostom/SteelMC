@@ -203,6 +203,157 @@ impl EntityTracker {
         self.tracked_entities.read().len()
     }
 
+    /// Ticks all entity behaviors
+    ///
+    /// This updates entity AI, movement, and other behaviors.
+    /// Should be called every game tick (20 times per second).
+    pub fn tick_entities(&self, tick_count: u64, chunk_map: &crate::chunk::chunk_map::ChunkMap) {
+        let tracked_entities = self.tracked_entities.read();
+
+        for tracked in tracked_entities.values() {
+            // Only tick entities that have custom tick behavior
+            if tracked.entity.has_tick() {
+                tracked.entity.tick(tick_count, self, chunk_map);
+            }
+        }
+    }
+
+    /// Finds all entities within a radius of a position.
+    ///
+    /// Returns entities sorted by distance (closest first).
+    /// The `exclude_id` parameter can be used to exclude the querying entity itself.
+    pub fn get_entities_in_radius(
+        &self,
+        center: steel_utils::math::Vector3<f64>,
+        radius: f64,
+        exclude_id: Option<i32>,
+    ) -> Vec<(i32, steel_utils::math::Vector3<f64>, f64)> {
+        let radius_squared = radius * radius;
+        let tracked_entities = self.tracked_entities.read();
+
+        let mut results: Vec<(i32, steel_utils::math::Vector3<f64>, f64)> = tracked_entities
+            .values()
+            .filter_map(|tracked| {
+                let entity_id = tracked.entity.entity_id();
+
+                // Skip excluded entity
+                if exclude_id == Some(entity_id) {
+                    return None;
+                }
+
+                let pos = tracked.entity.position();
+                let dx = pos.x - center.x;
+                let dy = pos.y - center.y;
+                let dz = pos.z - center.z;
+                let distance_squared = dx * dx + dy * dy + dz * dz;
+
+                if distance_squared <= radius_squared {
+                    Some((entity_id, pos, distance_squared))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sort by distance (closest first)
+        results.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        results
+    }
+
+    /// Finds all entities of a specific type within a radius.
+    ///
+    /// Returns entities sorted by distance (closest first).
+    pub fn get_entities_by_type_in_radius(
+        &self,
+        center: steel_utils::math::Vector3<f64>,
+        radius: f64,
+        entity_type_id: i32,
+        exclude_id: Option<i32>,
+    ) -> Vec<(i32, steel_utils::math::Vector3<f64>, f64)> {
+        let radius_squared = radius * radius;
+        let tracked_entities = self.tracked_entities.read();
+
+        let mut results: Vec<(i32, steel_utils::math::Vector3<f64>, f64)> = tracked_entities
+            .values()
+            .filter_map(|tracked| {
+                let entity_id = tracked.entity.entity_id();
+
+                // Skip excluded entity
+                if exclude_id == Some(entity_id) {
+                    return None;
+                }
+
+                // Check entity type
+                if tracked.entity.entity_type_id() != entity_type_id {
+                    return None;
+                }
+
+                let pos = tracked.entity.position();
+                let dx = pos.x - center.x;
+                let dy = pos.y - center.y;
+                let dz = pos.z - center.z;
+                let distance_squared = dx * dx + dy * dy + dz * dz;
+
+                if distance_squared <= radius_squared {
+                    Some((entity_id, pos, distance_squared))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sort by distance (closest first)
+        results.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        results
+    }
+
+    /// Finds the nearest entity matching a filter.
+    ///
+    /// The filter function receives the entity type ID and returns true if the entity should be considered.
+    pub fn get_nearest_entity<F>(
+        &self,
+        center: steel_utils::math::Vector3<f64>,
+        radius: f64,
+        exclude_id: Option<i32>,
+        filter: F,
+    ) -> Option<(i32, steel_utils::math::Vector3<f64>, f64)>
+    where
+        F: Fn(i32) -> bool,
+    {
+        let radius_squared = radius * radius;
+        let tracked_entities = self.tracked_entities.read();
+
+        let mut nearest: Option<(i32, steel_utils::math::Vector3<f64>, f64)> = None;
+
+        for tracked in tracked_entities.values() {
+            let entity_id = tracked.entity.entity_id();
+
+            // Skip excluded entity
+            if exclude_id == Some(entity_id) {
+                continue;
+            }
+
+            // Apply filter
+            if !filter(tracked.entity.entity_type_id()) {
+                continue;
+            }
+
+            let pos = tracked.entity.position();
+            let dx = pos.x - center.x;
+            let dy = pos.y - center.y;
+            let dz = pos.z - center.z;
+            let distance_squared = dx * dx + dy * dy + dz * dz;
+
+            if distance_squared <= radius_squared {
+                if nearest.is_none() || distance_squared < nearest.as_ref().unwrap().2 {
+                    nearest = Some((entity_id, pos, distance_squared));
+                }
+            }
+        }
+
+        nearest
+    }
+
     /// Immediately updates visibility for a specific player (called when player joins)
     /// This matches vanilla's behavior of calling `updatePlayers()` right after adding an entity
     pub fn update_player_visibility(&self, player: &Arc<Player>) {

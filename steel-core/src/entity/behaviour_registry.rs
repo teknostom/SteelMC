@@ -4,7 +4,9 @@ use std::sync::OnceLock;
 
 use steel_registry::vanilla_entities::{self, ALL_ENTITY_TYPES};
 
-use super::behaviour::{DEFAULT_BEHAVIOUR, DISPLAY_BEHAVIOUR, EntityBehaviour, SLIME_BEHAVIOUR};
+use super::behaviour::{
+    DEFAULT_BEHAVIOUR, DISPLAY_BEHAVIOUR, EntityBehaviour, SLIME_BEHAVIOUR, ZOMBIE_BEHAVIOUR,
+};
 
 /// Registry for entity behaviours, indexed by entity type ID.
 pub struct EntityBehaviourRegistry {
@@ -43,6 +45,24 @@ impl EntityBehaviourRegistry {
             &mut behaviors,
             &vanilla_entities::TEXT_DISPLAY,
             &DISPLAY_BEHAVIOUR,
+        );
+
+        // Zombie family
+        Self::assign_behaviour(
+            &mut behaviors,
+            &vanilla_entities::ZOMBIE,
+            &*ZOMBIE_BEHAVIOUR,
+        );
+        Self::assign_behaviour(
+            &mut behaviors,
+            &vanilla_entities::ZOMBIE_VILLAGER,
+            &*ZOMBIE_BEHAVIOUR,
+        );
+        Self::assign_behaviour(&mut behaviors, &vanilla_entities::HUSK, &*ZOMBIE_BEHAVIOUR);
+        Self::assign_behaviour(
+            &mut behaviors,
+            &vanilla_entities::DROWNED,
+            &*ZOMBIE_BEHAVIOUR,
         );
 
         Self { behaviors }

@@ -3,6 +3,7 @@
 //! This module contains the entity tracking and synchronization systems
 //! that allow players to see each other and their actions.
 
+pub mod ai;
 pub mod behaviour;
 pub mod behaviour_registry;
 pub mod entity_data;
@@ -12,7 +13,10 @@ pub mod packet_helpers;
 pub mod player_entity;
 pub mod tracked_entity;
 
-pub use behaviour::{DEFAULT_BEHAVIOUR, DISPLAY_BEHAVIOUR, EntityBehaviour, SLIME_BEHAVIOUR};
+pub use behaviour::{
+    DEFAULT_BEHAVIOUR, DISPLAY_BEHAVIOUR, EntityBehaviour, EntityTickContext, SLIME_BEHAVIOUR,
+    ZOMBIE_BEHAVIOUR,
+};
 pub use behaviour_registry::{EntityBehaviourRegistry, get_behaviour_registry};
 pub use entity_data::{
     EntityBlockState, EntityData, EntityDataAccessor, EntityDataValue, IntoEntityData, Quaternionf,
@@ -60,6 +64,24 @@ pub trait Entity: Send + Sync {
 
     /// Called when the entity is no longer visible to a player
     fn remove_seen_by_player(&self, _player_uuid: Uuid) {}
+
+    /// Tick the entity's behavior (AI, movement, etc.)
+    ///
+    /// This is called every game tick (20 times per second) for entities
+    /// that have behaviors to update. The entity tracker is provided for
+    /// querying nearby entities, and chunk_map for block queries.
+    fn tick(
+        &self,
+        _tick_count: u64,
+        _entity_tracker: &EntityTracker,
+        _chunk_map: &crate::chunk::chunk_map::ChunkMap,
+    ) {
+    }
+
+    /// Returns true if this entity has custom tick behavior
+    fn has_tick(&self) -> bool {
+        false
+    }
 }
 
 /// Represents an entity's pose (standing, crouching, etc.)
