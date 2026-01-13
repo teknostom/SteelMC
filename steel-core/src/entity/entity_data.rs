@@ -49,7 +49,6 @@ pub enum EntityDataValue {
     OptionalString(Option<String>),
     /// Optional text component (for custom names with formatting)
     OptionalTextComponent(Option<String>),
-<<<<<<< Updated upstream
     /// 3D vector (for Display entity transformations)
     Vector3(Vector3f),
     /// Quaternion (for Display entity rotations)
@@ -77,8 +76,6 @@ pub enum EntityDataValue {
     // PaintingVariant(i32),
     // SnifferState(i32),
     // ArmadilloState(i32),
-=======
->>>>>>> Stashed changes
 }
 
 impl EntityDataValue {
