@@ -66,6 +66,7 @@ impl World {
                     existing_player.gameprofile.id,
                     existing_player.gameprofile.name.clone(),
                     existing_player.gameprofile.properties.clone(),
+                    existing_player.game_mode.load() as i32,
                 );
                 player.connection.send_packet(add_existing);
 
@@ -88,6 +89,7 @@ impl World {
             player.gameprofile.id,
             player.gameprofile.name.clone(),
             player.gameprofile.properties.clone(),
+            player.game_mode.load() as i32,
         );
 
         self.players.iter_sync(|_, p| {

@@ -41,9 +41,7 @@ impl WriteTo for CAddEntity {
         writer.write_all(&self.y.to_be_bytes())?;
         writer.write_all(&self.z.to_be_bytes())?;
 
-        // Write velocity as LpVec3 (compressed format)
-        // For now, just write zero velocity (single 0 byte) since players don't have physics yet
-        // TODO: Implement proper LpVec3 encoding when velocity is needed
+        // Write velocity as LpVec3 (zero velocity = single 0 byte)
         writer.write_all(&[0u8])?;
 
         self.pitch.write(writer)?;

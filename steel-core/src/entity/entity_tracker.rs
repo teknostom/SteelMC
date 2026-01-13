@@ -9,7 +9,7 @@ use uuid::Uuid;
 use super::{Entity, TrackedEntity};
 use crate::player::Player;
 use steel_utils::ChunkPos;
-use steel_utils::locks::{SyncMutex, SyncRwLock};
+use steel_utils::locks::SyncRwLock;
 
 /// Default entity tracking range in blocks (4 chunks)
 pub const DEFAULT_ENTITY_TRACKING_RANGE_BLOCKS: i32 = 64;
@@ -22,8 +22,8 @@ pub struct EntityTracker {
     /// Map of player UUID to their visible entities
     player_tracking: SyncRwLock<FxHashMap<Uuid, FxHashSet<i32>>>,
 
-    /// Global entity ID counter
-    next_entity_id: SyncMutex<i32>,
+    /// Global entity ID counter (uses `AtomicI32` for lock-free allocation)
+    next_entity_id: std::sync::atomic::AtomicI32,
 }
 
 impl EntityTracker {
@@ -33,16 +33,14 @@ impl EntityTracker {
         Self {
             tracked_entities: SyncRwLock::new(FxHashMap::default()),
             player_tracking: SyncRwLock::new(FxHashMap::default()),
-            next_entity_id: SyncMutex::new(1_000_000),
+            next_entity_id: std::sync::atomic::AtomicI32::new(0),
         }
     }
 
     /// Allocates a new unique entity ID
     pub fn allocate_entity_id(&self) -> i32 {
-        let mut next_id = self.next_entity_id.lock();
-        let id = *next_id;
-        *next_id += 1;
-        id
+        self.next_entity_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Adds an entity to tracking
@@ -75,6 +73,7 @@ impl EntityTracker {
     /// This should be called every tick to update which entities players can see
     pub fn tick(&self, players: &[Arc<Player>]) {
         let tracked_entities = self.tracked_entities.read();
+        let mut player_tracking = self.player_tracking.write();
 
         for player in players {
             let player_uuid = player.gameprofile.id;
@@ -82,7 +81,6 @@ impl EntityTracker {
             let player_chunk = *player.last_chunk_pos.lock();
 
             // Get or create tracking set for this player
-            let mut player_tracking = self.player_tracking.write();
             let visible_entities = player_tracking.entry(player_uuid).or_default();
 
             // Check each tracked entity
@@ -214,10 +212,11 @@ impl EntityTracker {
         #[allow(clippy::cast_possible_truncation)]
         let player_chunk = ChunkPos::new((player_pos.x as i32) >> 4, (player_pos.z as i32) >> 4);
 
+        // IMPORTANT: Lock ordering must match tick() to prevent deadlock
+        // Always: tracked_entities first, then player_tracking
+        let tracked_entities = self.tracked_entities.read();
         let mut player_tracking = self.player_tracking.write();
         let visible_entities = player_tracking.entry(player_uuid).or_default();
-
-        let tracked_entities = self.tracked_entities.read();
 
         for tracked in tracked_entities.values() {
             let entity_id = tracked.entity.entity_id();

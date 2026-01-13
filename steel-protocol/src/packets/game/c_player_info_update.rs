@@ -38,7 +38,12 @@ pub struct CPlayerInfoUpdate {
 }
 
 impl CPlayerInfoUpdate {
-    pub fn add_player(uuid: Uuid, name: String, properties: Vec<GameProfileProperty>) -> Self {
+    pub fn add_player(
+        uuid: Uuid,
+        name: String,
+        properties: Vec<GameProfileProperty>,
+        game_mode: i32,
+    ) -> Self {
         Self {
             actions: PlayerInfoAction::AddPlayer as u8
                 | PlayerInfoAction::InitializeChat as u8
@@ -50,9 +55,9 @@ impl CPlayerInfoUpdate {
                 name: Some(name),
                 properties: Some(properties),
                 chat_session: None,
-                game_mode: Some(VarInt(1)), // Creative mode
-                listed: Some(true),         // Show in tab list
-                latency: Some(VarInt(0)),   // 0ms latency
+                game_mode: Some(VarInt(game_mode)),
+                listed: Some(true),
+                latency: Some(VarInt(0)),
             }],
         }
     }

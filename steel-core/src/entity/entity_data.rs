@@ -49,6 +49,7 @@ pub enum EntityDataValue {
     OptionalString(Option<String>),
     /// Optional text component (for custom names with formatting)
     OptionalTextComponent(Option<String>),
+<<<<<<< Updated upstream
     /// 3D vector (for Display entity transformations)
     Vector3(Vector3f),
     /// Quaternion (for Display entity rotations)
@@ -76,6 +77,8 @@ pub enum EntityDataValue {
     // PaintingVariant(i32),
     // SnifferState(i32),
     // ArmadilloState(i32),
+=======
+>>>>>>> Stashed changes
 }
 
 impl EntityDataValue {
@@ -318,7 +321,6 @@ impl DataItem {
 
 /// Entity data storage with dirty tracking
 pub struct EntityData {
-    entity_id: i32,
     items: SyncRwLock<FxHashMap<u8, DataItem>>,
     is_dirty: AtomicBool,
 }
@@ -326,9 +328,8 @@ pub struct EntityData {
 impl EntityData {
     /// Creates a new entity data storage
     #[must_use]
-    pub fn new(entity_id: i32) -> Self {
+    pub fn new() -> Self {
         Self {
-            entity_id,
             items: SyncRwLock::new(FxHashMap::default()),
             is_dirty: AtomicBool::new(false),
         }
@@ -342,18 +343,51 @@ impl EntityData {
     }
 
     /// Sets a data field value
+    ///
+    /// Only marks dirty if the value actually changed, avoiding unnecessary network traffic.
     pub fn set<T: IntoEntityData>(&self, accessor: EntityDataAccessor<T>, value: T) {
         let new_value = value.into_entity_data();
         let mut items = self.items.write();
 
         if let Some(item) = items.get_mut(&accessor.id) {
-            item.set_value(new_value);
-            self.is_dirty.store(true, Ordering::Release);
+            // Only update if value changed
+            if item.value != new_value {
+                item.set_value(new_value);
+                self.is_dirty.store(true, Ordering::Release);
+            }
         } else {
             // If not defined, define it now
             let item = DataItem::new(new_value);
             items.insert(accessor.id, item);
             self.is_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// Atomically modifies a data field value using a closure
+    ///
+    /// The closure receives the current value and returns the new value.
+    /// The entire read-modify-write is atomic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the field is not defined or type mismatch.
+    pub fn modify<T: IntoEntityData>(
+        &self,
+        accessor: EntityDataAccessor<T>,
+        f: impl FnOnce(T) -> T,
+    ) {
+        let mut items = self.items.write();
+
+        if let Some(item) = items.get_mut(&accessor.id) {
+            let current =
+                T::from_entity_data(&item.value).expect("Entity data type mismatch in modify");
+            let new_value = f(current).into_entity_data();
+            if item.value != new_value {
+                item.set_value(new_value);
+                self.is_dirty.store(true, Ordering::Release);
+            }
+        } else {
+            panic!("Entity data field not defined");
         }
     }
 
@@ -376,12 +410,19 @@ impl EntityData {
     }
 
     /// Packs all dirty data values into a vec, marking them as clean
+    ///
+    /// Uses a write lock to ensure atomicity - no updates can occur between
+    /// reading values and clearing dirty flags.
     pub fn pack_dirty(&self) -> Option<Vec<(u8, EntityDataValue)>> {
+        // Early check without lock (optimization for common case of no changes)
         if !self.is_dirty() {
             return None;
         }
 
-        let items = self.items.read();
+        // Must use write lock to prevent race condition:
+        // Without it, another thread could set() a new value between our
+        // value.clone() and mark_clean(), causing the update to be lost.
+        let items = self.items.write();
         let dirty_items: Vec<(u8, EntityDataValue)> = items
             .iter()
             .filter(|(_, item)| item.is_dirty())
@@ -391,11 +432,11 @@ impl EntityData {
             })
             .collect();
 
+        self.is_dirty.store(false, Ordering::Release);
+
         if dirty_items.is_empty() {
-            self.is_dirty.store(false, Ordering::Release);
             None
         } else {
-            self.is_dirty.store(false, Ordering::Release);
             Some(dirty_items)
         }
     }
@@ -411,10 +452,11 @@ impl EntityData {
             })
             .collect()
     }
+}
 
-    /// Gets the entity ID this data belongs to
-    pub fn entity_id(&self) -> i32 {
-        self.entity_id
+impl Default for EntityData {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

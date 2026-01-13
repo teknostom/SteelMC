@@ -5,6 +5,7 @@
 
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 use super::{Entity, packet_helpers::entity_data_to_packet_entries};
@@ -14,7 +15,13 @@ use steel_protocol::packets::game::{
     CSetEntityData, CTeleportEntity,
 };
 use steel_utils::codec::VarInt;
-use steel_utils::locks::{SyncMutex, SyncRwLock};
+use steel_utils::locks::SyncRwLock;
+
+/// Last synced transform (position + rotation) - grouped to reduce lock contention
+struct LastTransform {
+    position: steel_utils::math::Vector3<f64>,
+    rotation: (f32, f32),
+}
 
 /// Wrapper around an entity that tracks visibility to players
 pub struct TrackedEntity {
@@ -27,17 +34,14 @@ pub struct TrackedEntity {
     /// Tracking range in blocks
     pub tracking_range_blocks: i32,
 
-    /// Last synced position
-    last_position: SyncRwLock<steel_utils::math::Vector3<f64>>,
-
-    /// Last synced rotation
-    last_rotation: SyncRwLock<(f32, f32)>,
+    /// Last synced transform (position + rotation)
+    last_transform: SyncRwLock<LastTransform>,
 
     /// Update interval in ticks (how often to broadcast changes)
     update_interval: u8,
 
     /// Tick counter for update intervals
-    tick_count: SyncMutex<u64>,
+    tick_count: AtomicU64,
 }
 
 impl TrackedEntity {
@@ -50,10 +54,9 @@ impl TrackedEntity {
             entity,
             seen_by: SyncRwLock::new(FxHashMap::default()),
             tracking_range_blocks,
-            last_position: SyncRwLock::new(position),
-            last_rotation: SyncRwLock::new(rotation),
+            last_transform: SyncRwLock::new(LastTransform { position, rotation }),
             update_interval: 1, // Update every tick by default
-            tick_count: SyncMutex::new(0),
+            tick_count: AtomicU64::new(0),
         }
     }
 
@@ -98,10 +101,13 @@ impl TrackedEntity {
         let position = self.entity.position();
         let (yaw, pitch) = self.entity.rotation();
 
-        // Update last_position to match what we're about to send
+        // Update last transform to match what we're about to send
         // This ensures future delta calculations are correct
-        *self.last_position.write() = position;
-        *self.last_rotation.write() = (yaw, pitch);
+        {
+            let mut transform = self.last_transform.write();
+            transform.position = position;
+            transform.rotation = (yaw, pitch);
+        }
 
         // Send CAddEntity to tell the client about this entity
         let add_entity_packet = CAddEntity {
@@ -152,131 +158,148 @@ impl TrackedEntity {
     /// This should be tracked per-entity and set correctly.
     #[allow(clippy::too_many_lines)]
     pub fn send_changes(&self) {
-        let mut tick_count = self.tick_count.lock();
-        *tick_count += 1;
+
+        // Check if movement is too large for delta encoding
+        // Delta encoding uses i16: (pos * 32 - last_pos * 32) * 128
+        // i16::MAX (32767) / 128 / 32 = 7.99 blocks max
+        // Use 7.9 for safety margin with floating point precision
+        const MAX_DELTA_BLOCKS: f64 = 7.9;
+        // Atomic increment - no lock needed
+        let tick = self.tick_count.fetch_add(1, Ordering::Relaxed);
 
         // Only update at specified interval
-        if !(*tick_count).is_multiple_of(u64::from(self.update_interval)) {
+        if !tick.is_multiple_of(u64::from(self.update_interval)) {
             return;
         }
 
         let current_pos = self.entity.position();
         let current_rot = self.entity.rotation();
-        let mut last_pos = self.last_position.write();
-        let mut last_rot = self.last_rotation.write();
 
-        let pos_changed = *last_pos != current_pos;
-        let rot_changed = *last_rot != current_rot;
+        // Single lock for both position and rotation
+        let mut transform = self.last_transform.write();
+        let last_pos = transform.position;
+        let last_rot = transform.rotation;
 
-        let seen_by = self.seen_by.read();
-        if seen_by.is_empty() {
-            // No one watching, just update last_position to keep it current
-            if pos_changed || rot_changed {
-                *last_pos = current_pos;
-                *last_rot = current_rot;
-            }
+        let pos_changed = last_pos != current_pos;
+        let rot_changed = last_rot != current_rot;
+
+        // Early exit if nothing changed - release lock first
+        if !pos_changed && !rot_changed {
+            drop(transform);
+            // Still check entity data even if transform unchanged
+            self.send_dirty_entity_data();
             return;
         }
 
-        // Send position/rotation updates if changed
-        if pos_changed || rot_changed {
-            let entity_id = self.entity.entity_id();
+        // Update transform before sending (so it's correct even if we return early)
+        transform.position = current_pos;
+        transform.rotation = current_rot;
+        drop(transform);
 
-            // Check if movement is too large for delta encoding (max ~8 blocks)
-            // Delta encoding uses i16 with formula: (pos * 32 - last_pos * 32) * 128
-            // Max i16 value 32767 / 128 / 32 = ~8 blocks
-            let dx = (current_pos.x - last_pos.x).abs();
-            let dy = (current_pos.y - last_pos.y).abs();
-            let dz = (current_pos.z - last_pos.z).abs();
-            let max_delta = dx.max(dy).max(dz);
+        let seen_by = self.seen_by.read();
+        if seen_by.is_empty() {
+            return;
+        }
 
-            if pos_changed && max_delta > 8.0 {
-                // Movement too large, use teleport packet instead
-                let velocity = self.entity.delta_movement();
-                let packet = CTeleportEntity {
-                    entity_id,
-                    x: current_pos.x,
-                    y: current_pos.y,
-                    z: current_pos.z,
-                    delta_x: velocity.x,
-                    delta_y: velocity.y,
-                    delta_z: velocity.z,
-                    yaw: current_rot.0,
-                    pitch: current_rot.1,
-                    relatives: 0, // All absolute positioning
-                    on_ground: true,
-                };
+        let entity_id = self.entity.entity_id();
 
-                for player in seen_by.values() {
-                    player.connection.send_packet(packet.clone());
-                }
-            } else if pos_changed && rot_changed {
-                // Both position and rotation changed
-                let delta_x = ((current_pos.x * 32.0 - last_pos.x * 32.0) * 128.0) as i16;
-                let delta_y = ((current_pos.y * 32.0 - last_pos.y * 32.0) * 128.0) as i16;
-                let delta_z = ((current_pos.z * 32.0 - last_pos.z * 32.0) * 128.0) as i16;
 
-                let packet = CMoveEntityPosRot {
-                    entity_id,
-                    delta_x,
-                    delta_y,
-                    delta_z,
-                    yaw: (current_rot.0 * 256.0 / 360.0) as i8,
-                    pitch: (current_rot.1 * 256.0 / 360.0) as i8,
-                    on_ground: true,
-                };
+        let dx = (current_pos.x - last_pos.x).abs();
+        let dy = (current_pos.y - last_pos.y).abs();
+        let dz = (current_pos.z - last_pos.z).abs();
+        let max_delta = dx.max(dy).max(dz);
 
-                for player in seen_by.values() {
-                    player.connection.send_packet(packet.clone());
-                }
-            } else if pos_changed {
-                // Only position changed
-                let delta_x = ((current_pos.x * 32.0 - last_pos.x * 32.0) * 128.0) as i16;
-                let delta_y = ((current_pos.y * 32.0 - last_pos.y * 32.0) * 128.0) as i16;
-                let delta_z = ((current_pos.z * 32.0 - last_pos.z * 32.0) * 128.0) as i16;
+        let on_ground = true;
 
-                let packet = CMoveEntityPos {
-                    entity_id,
-                    delta_x,
-                    delta_y,
-                    delta_z,
-                    on_ground: true,
-                };
+        if pos_changed && max_delta >= MAX_DELTA_BLOCKS {
+            // Movement too large, use teleport packet instead
+            let velocity = self.entity.delta_movement();
+            let packet = CTeleportEntity {
+                entity_id,
+                x: current_pos.x,
+                y: current_pos.y,
+                z: current_pos.z,
+                delta_x: velocity.x,
+                delta_y: velocity.y,
+                delta_z: velocity.z,
+                yaw: current_rot.0,
+                pitch: current_rot.1,
+                relatives: 0, // All absolute positioning
+                on_ground,
+            };
 
-                for player in seen_by.values() {
-                    player.connection.send_packet(packet.clone());
-                }
-            } else if rot_changed {
-                // Only rotation changed
-                let packet = CMoveEntityRot {
-                    entity_id,
-                    yaw: (current_rot.0 * 256.0 / 360.0) as i8,
-                    pitch: (current_rot.1 * 256.0 / 360.0) as i8,
-                    on_ground: true,
-                };
-
-                for player in seen_by.values() {
-                    player.connection.send_packet(packet.clone());
-                }
+            for player in seen_by.values() {
+                player.connection.send_packet(packet.clone());
             }
+        } else if pos_changed && rot_changed {
+            // Both position and rotation changed
+            let delta_x = ((current_pos.x * 32.0 - last_pos.x * 32.0) * 128.0) as i16;
+            let delta_y = ((current_pos.y * 32.0 - last_pos.y * 32.0) * 128.0) as i16;
+            let delta_z = ((current_pos.z * 32.0 - last_pos.z * 32.0) * 128.0) as i16;
 
-            // Update last position after sending packets
-            *last_pos = current_pos;
-            *last_rot = current_rot;
+            let packet = CMoveEntityPosRot {
+                entity_id,
+                delta_x,
+                delta_y,
+                delta_z,
+                yaw: (current_rot.0 * 256.0 / 360.0) as i8,
+                pitch: (current_rot.1 * 256.0 / 360.0) as i8,
+                on_ground,
+            };
 
-            // Send head rotation update separately if yaw changed
-            if rot_changed {
-                let head_packet = CRotateHead {
-                    entity_id: VarInt(entity_id),
-                    head_yaw: (current_rot.0 * 256.0 / 360.0) as i8,
-                };
-                for player in seen_by.values() {
-                    player.connection.send_packet(head_packet.clone());
-                }
+            for player in seen_by.values() {
+                player.connection.send_packet(packet.clone());
+            }
+        } else if pos_changed {
+            // Only position changed
+            let delta_x = ((current_pos.x * 32.0 - last_pos.x * 32.0) * 128.0) as i16;
+            let delta_y = ((current_pos.y * 32.0 - last_pos.y * 32.0) * 128.0) as i16;
+            let delta_z = ((current_pos.z * 32.0 - last_pos.z * 32.0) * 128.0) as i16;
+
+            let packet = CMoveEntityPos {
+                entity_id,
+                delta_x,
+                delta_y,
+                delta_z,
+                on_ground,
+            };
+
+            for player in seen_by.values() {
+                player.connection.send_packet(packet.clone());
+            }
+        } else if rot_changed {
+            // Only rotation changed
+            let packet = CMoveEntityRot {
+                entity_id,
+                yaw: (current_rot.0 * 256.0 / 360.0) as i8,
+                pitch: (current_rot.1 * 256.0 / 360.0) as i8,
+                on_ground,
+            };
+
+            for player in seen_by.values() {
+                player.connection.send_packet(packet.clone());
             }
         }
 
+        // Send head rotation update separately if yaw changed
+        if rot_changed {
+            let head_packet = CRotateHead {
+                entity_id: VarInt(entity_id),
+                head_yaw: (current_rot.0 * 256.0 / 360.0) as i8,
+            };
+            for player in seen_by.values() {
+                player.connection.send_packet(head_packet.clone());
+            }
+        }
+
+        drop(seen_by);
+
         // Send entity data updates if dirty
+        self.send_dirty_entity_data();
+    }
+
+    /// Sends dirty entity data to all tracking players
+    fn send_dirty_entity_data(&self) {
         let entity_data = self.entity.entity_data();
         if let Some(dirty_data) = entity_data.pack_dirty() {
             let packet = CSetEntityData {
@@ -284,6 +307,7 @@ impl TrackedEntity {
                 metadata: entity_data_to_packet_entries(dirty_data),
             };
 
+            let seen_by = self.seen_by.read();
             for player in seen_by.values() {
                 player.connection.send_packet(packet.clone());
             }

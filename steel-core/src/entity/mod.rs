@@ -24,7 +24,7 @@ pub use packet_helpers::{entity_data_to_packet_entries, serialize_entity_data_va
 pub use player_entity::PlayerEntity;
 pub use tracked_entity::TrackedEntity;
 
-use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use steel_registry::item_stack::ItemStack;
 use steel_utils::locks::SyncMutex;
 use steel_utils::math::Vector3;
@@ -125,24 +125,15 @@ pub struct BaseEntity {
     /// Entity velocity/delta movement
     pub delta_movement: SyncMutex<Vector3<f64>>,
 
-    /// Synchronized entity data
+    /// Synchronized entity data (includes shared flags at index 0)
     pub entity_data: EntityData,
-
-    /// Whether the entity is on fire (bit 0)
-    /// Whether the entity is crouching/shifting (bit 1)
-    /// Whether the entity is sprinting (bit 3)
-    /// Whether the entity is swimming (bit 4)
-    /// Whether the entity is invisible (bit 5)
-    /// Whether the entity is glowing (bit 6)
-    /// Whether the entity is flying with elytra (bit 7)
-    shared_flags: AtomicU8,
 }
 
 impl BaseEntity {
     /// Creates a new base entity
     #[must_use]
     pub fn new(entity_id: i32, entity_type_id: i32, uuid: Uuid, position: Vector3<f64>) -> Self {
-        let mut entity_data = EntityData::new(entity_id);
+        let mut entity_data = EntityData::new();
 
         // Register default entity data fields
         entity_data.define(EntityDataAccessor::SHARED_FLAGS, 0u8);
@@ -162,72 +153,76 @@ impl BaseEntity {
             rotation: SyncMutex::new((0.0, 0.0)),
             delta_movement: SyncMutex::new(Vector3::default()),
             entity_data,
-            shared_flags: AtomicU8::new(0),
         }
     }
 
-    /// Sets a shared flag bit
+    /// Shared flag bits for entity state
+    const FLAG_ON_FIRE: u8 = 0;
+    const FLAG_SHIFT_KEY_DOWN: u8 = 1;
+    const FLAG_SPRINTING: u8 = 3;
+    const FLAG_SWIMMING: u8 = 4;
+    const FLAG_INVISIBLE: u8 = 5;
+    const FLAG_GLOWING: u8 = 6;
+    const FLAG_FALL_FLYING: u8 = 7;
+
+    /// Sets a shared flag bit atomically
     pub fn set_shared_flag(&self, bit: u8, value: bool) {
-        let mut flags = self.shared_flags.load(Ordering::Relaxed);
-        if value {
-            flags |= 1 << bit;
-        } else {
-            flags &= !(1 << bit);
-        }
-        self.shared_flags.store(flags, Ordering::Relaxed);
+        let mask = 1u8 << bit;
         self.entity_data
-            .set(EntityDataAccessor::SHARED_FLAGS, flags);
+            .modify(EntityDataAccessor::SHARED_FLAGS, |flags| {
+                if value { flags | mask } else { flags & !mask }
+            });
     }
 
     /// Gets a shared flag bit
     pub fn get_shared_flag(&self, bit: u8) -> bool {
-        let flags = self.shared_flags.load(Ordering::Relaxed);
+        let flags = self.entity_data.get::<u8>(EntityDataAccessor::SHARED_FLAGS);
         (flags & (1 << bit)) != 0
     }
 
     /// Sets whether the entity is on fire
     pub fn set_on_fire(&self, on_fire: bool) {
-        self.set_shared_flag(0, on_fire);
+        self.set_shared_flag(Self::FLAG_ON_FIRE, on_fire);
     }
 
     /// Sets whether the entity is crouching (shift key down)
     pub fn set_shift_key_down(&self, crouching: bool) {
-        self.set_shared_flag(1, crouching);
+        self.set_shared_flag(Self::FLAG_SHIFT_KEY_DOWN, crouching);
     }
 
     /// Gets whether the entity is crouching
     pub fn is_shift_key_down(&self) -> bool {
-        self.get_shared_flag(1)
+        self.get_shared_flag(Self::FLAG_SHIFT_KEY_DOWN)
     }
 
     /// Sets whether the entity is sprinting
     pub fn set_sprinting(&self, sprinting: bool) {
-        self.set_shared_flag(3, sprinting);
+        self.set_shared_flag(Self::FLAG_SPRINTING, sprinting);
     }
 
     /// Gets whether the entity is sprinting
     pub fn is_sprinting(&self) -> bool {
-        self.get_shared_flag(3)
+        self.get_shared_flag(Self::FLAG_SPRINTING)
     }
 
     /// Sets whether the entity is swimming
     pub fn set_swimming(&self, swimming: bool) {
-        self.set_shared_flag(4, swimming);
+        self.set_shared_flag(Self::FLAG_SWIMMING, swimming);
     }
 
     /// Sets whether the entity is invisible
     pub fn set_invisible(&self, invisible: bool) {
-        self.set_shared_flag(5, invisible);
+        self.set_shared_flag(Self::FLAG_INVISIBLE, invisible);
     }
 
     /// Sets whether the entity is glowing
     pub fn set_glowing(&self, glowing: bool) {
-        self.set_shared_flag(6, glowing);
+        self.set_shared_flag(Self::FLAG_GLOWING, glowing);
     }
 
     /// Sets whether the entity is flying with elytra
     pub fn set_fall_flying(&self, flying: bool) {
-        self.set_shared_flag(7, flying);
+        self.set_shared_flag(Self::FLAG_FALL_FLYING, flying);
     }
 
     /// Sets the entity's pose

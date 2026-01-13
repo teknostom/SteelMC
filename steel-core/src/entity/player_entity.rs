@@ -50,8 +50,6 @@ impl Entity for PlayerEntity {
     }
 
     fn delta_movement(&self) -> Vector3<f64> {
-        // Players don't have physics yet, so return zero velocity
-        // TODO: Implement player velocity tracking
         Vector3::default()
     }
 
