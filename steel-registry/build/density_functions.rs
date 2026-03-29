@@ -917,12 +917,25 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
 
 use proc_macro2::{Ident, Span};
 
-/// Generate the complete density functions module using the transpiler.
+/// Output of the density functions build step: one `TokenStream` per dimension file,
+/// plus a thin index file that re-exports them.
+pub(crate) struct DensityFunctionFiles {
+    /// Contents for `vanilla_density_functions_overworld.rs`.
+    pub overworld: TokenStream,
+    /// Contents for `vanilla_density_functions_nether.rs`.
+    pub nether: TokenStream,
+    /// Contents for `vanilla_density_functions_end.rs`.
+    pub end: TokenStream,
+    /// Contents for `vanilla_density_functions.rs` (index that includes the three above).
+    pub index: TokenStream,
+}
+
+/// Generate density function code for all dimensions, split into one file per dimension.
 ///
-/// Transpiles density functions for all dimensions (overworld, nether, end).
-/// Overworld types are at the top level for backward compatibility.
-/// Other dimensions are in submodules.
-pub(crate) fn build() -> TokenStream {
+/// Each dimension file is self-contained (no wrapping `mod` needed since each lives
+/// in its own `generated/` file).  The index file re-exports the dimension submodules
+/// under the same public API that callers already use.
+pub(crate) fn build() -> DensityFunctionFiles {
     let registry_json = read_density_function_registry();
 
     // Convert JSON registry to DensityFunction values (shared across dimensions)
@@ -931,27 +944,49 @@ pub(crate) fn build() -> TokenStream {
         .map(|(id, json)| (id.clone(), json_to_df(json)))
         .collect();
 
-    let overworld = transpile_dimension("overworld", "Overworld", &registry);
+    let overworld_df = transpile_dimension("overworld", "Overworld", &registry);
     let overworld_settings = generate_noise_settings("overworld", "Overworld");
-    let nether = transpile_dimension("nether", "Nether", &registry);
+    let nether_df = transpile_dimension("nether", "Nether", &registry);
     let nether_settings = generate_noise_settings("nether", "Nether");
-    let end = transpile_dimension("end", "End", &registry);
+    let end_df = transpile_dimension("end", "End", &registry);
     let end_settings = generate_noise_settings("end", "End");
 
-    quote! {
-        #overworld
+    // Note: the transpiler already emits `use` imports in #overworld_df / #nether_df / #end_df.
+    let overworld = quote! {
+        #overworld_df
         #overworld_settings
+    };
+
+    let nether = quote! {
+        #nether_df
+        #nether_settings
+    };
+
+    let end = quote! {
+        #end_df
+        #end_settings
+    };
+
+    // The index file re-exports per-dimension submodules using #[path] to point at
+    // the sibling generated files, preserving the existing public API.
+    let index = quote! {
+        #[path = "vanilla_density_functions_overworld.rs"]
+        mod overworld_impl;
+        pub use overworld_impl::*;
 
         /// Nether density functions.
-        pub mod nether {
-            #nether
-            #nether_settings
-        }
+        #[path = "vanilla_density_functions_nether.rs"]
+        pub mod nether;
 
         /// End density functions.
-        pub mod end {
-            #end
-            #end_settings
-        }
+        #[path = "vanilla_density_functions_end.rs"]
+        pub mod end;
+    };
+
+    DensityFunctionFiles {
+        overworld,
+        nether,
+        end,
+        index,
     }
 }

@@ -93,6 +93,9 @@ const SOUND_TYPES: &str = "sound_types";
 const MULTI_NOISE: &str = "multi_noise";
 const NOISE_PARAMETERS: &str = "noise_parameters";
 const DENSITY_FUNCTIONS: &str = "density_functions";
+const DENSITY_FUNCTIONS_OVERWORLD: &str = "density_functions_overworld";
+const DENSITY_FUNCTIONS_NETHER: &str = "density_functions_nether";
+const DENSITY_FUNCTIONS_END: &str = "density_functions_end";
 
 pub fn main() {
     // Rerun build script when any file in the build/ directory changes
@@ -149,14 +152,23 @@ pub fn main() {
         (sound_types::build(), SOUND_TYPES),
         (multi_noise::build(), MULTI_NOISE),
         (noise_parameters::build(), NOISE_PARAMETERS),
-        (density_functions::build(), DENSITY_FUNCTIONS),
         (poi_types::build(), POI_TYPES),
+    ];
+
+    let df = density_functions::build();
+    let df_builds = [
+        (df.overworld, DENSITY_FUNCTIONS_OVERWORLD),
+        (df.nether, DENSITY_FUNCTIONS_NETHER),
+        (df.end, DENSITY_FUNCTIONS_END),
+        (df.index, DENSITY_FUNCTIONS),
     ];
 
     // Track which files we're generating this run
     let mut generated_files: Vec<std::path::PathBuf> = Vec::new();
 
-    for (content, file_name) in vanilla_builds {
+    let all_builds = vanilla_builds.into_iter().chain(df_builds);
+
+    for (content, file_name) in all_builds {
         let path = out_dir.join(format!("vanilla_{file_name}.rs"));
         let content = content.to_string();
         generated_files.push(path.clone());
@@ -183,13 +195,6 @@ pub fn main() {
     if FMT && let Ok(entries) = fs::read_dir(&out_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            // Skip density_functions — the generated file is too large for rustfmt
-            if path
-                .file_name()
-                .is_some_and(|n| n == "vanilla_density_functions.rs")
-            {
-                continue;
-            }
             let _ = Command::new("rustfmt").arg(path).output();
         }
     }
