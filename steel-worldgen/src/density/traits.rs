@@ -273,6 +273,11 @@ pub trait DimensionNoises: Sized + Send + Sync {
     /// Whether the generated surface rule reads biome-dependent context.
     fn surface_rule_uses_biome() -> bool;
 
+    /// Distinct `biome_is` sets the generated surface rule tests, as biome
+    /// registry ids. Together with a biome's temperature parameters these are
+    /// everything the rule can observe about a biome.
+    fn surface_rule_biome_sets() -> &'static [Box<[u16]>];
+
     /// Whether the generated surface rule reads preliminary surface level.
     fn surface_rule_uses_preliminary_surface() -> bool;
 

@@ -719,24 +719,28 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
         surface_noise_ids_tokens,
         surface_gradient_ids_tokens,
         surface_block_states_tokens,
+        surface_biome_sets_tokens,
         surface_rule_uses_biome,
         surface_rule_uses_preliminary_surface,
         surface_rule_uses_surface_secondary,
         surface_rule_uses_steep,
     ) = if let Some(rule) = settings.surface_rule.take() {
-        let (
-            func,
-            noise_ids,
-            gradient_ids,
-            block_state_names,
-            uses_biome,
-            uses_preliminary_surface,
-            uses_surface_secondary,
-            uses_steep,
-        ) = generate_surface_rule_function(&rule, settings.noise.min_y, settings.noise.height);
-        let noise_id_literals: Vec<_> = noise_ids.iter().map(String::as_str).collect();
-        let gradient_id_literals: Vec<_> = gradient_ids.iter().map(String::as_str).collect();
-        let block_state_idents: Vec<_> = block_state_names
+        let artifacts =
+            generate_surface_rule_function(&rule, settings.noise.min_y, settings.noise.height);
+        let noise_id_literals: Vec<_> = artifacts.noise_ids.iter().map(String::as_str).collect();
+        let gradient_id_literals: Vec<_> =
+            artifacts.gradient_ids.iter().map(String::as_str).collect();
+        let biome_set_tokens = artifacts.biome_sets.iter().map(|set| {
+            let idents = set.iter().map(|name| {
+                let biome_name = name.strip_prefix("minecraft:").unwrap_or(name);
+                Ident::new(&biome_name.to_uppercase(), Span::call_site())
+            });
+            quote! {
+                Box::from([#(steel_registry::RegistryEntry::id(&*steel_registry::vanilla_biomes::#idents) as u16),*])
+            }
+        });
+        let block_state_idents: Vec<_> = artifacts
+            .block_state_names
             .iter()
             .map(|name| {
                 let block_name = name.strip_prefix("minecraft:").unwrap_or(name);
@@ -744,7 +748,7 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
             })
             .collect();
         (
-            func,
+            artifacts.func,
             quote! { &[#(#noise_id_literals),*] },
             quote! { &[#(#gradient_id_literals),*] },
             quote! {
@@ -758,10 +762,17 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
                     })
                 }
             },
-            uses_biome,
-            uses_preliminary_surface,
-            uses_surface_secondary,
-            uses_steep,
+            quote! {
+                {
+                    static BIOME_SETS: std::sync::OnceLock<Box<[Box<[u16]>]>> =
+                        std::sync::OnceLock::new();
+                    BIOME_SETS.get_or_init(|| Box::from([#(#biome_set_tokens),*]))
+                }
+            },
+            artifacts.uses_biome,
+            artifacts.uses_preliminary_surface,
+            artifacts.uses_surface_secondary,
+            artifacts.uses_steep,
         )
     } else {
         let empty_func = quote! {
@@ -775,6 +786,7 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
         };
         (
             empty_func,
+            quote! { &[] },
             quote! { &[] },
             quote! { &[] },
             quote! { &[] },
@@ -1045,6 +1057,10 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
 
             fn surface_rule_uses_biome() -> bool {
                 #surface_rule_uses_biome
+            }
+
+            fn surface_rule_biome_sets() -> &'static [Box<[u16]>] {
+                #surface_biome_sets_tokens
             }
 
             fn surface_rule_uses_preliminary_surface() -> bool {
