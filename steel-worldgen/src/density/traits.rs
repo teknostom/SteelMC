@@ -160,6 +160,12 @@ pub trait DimensionNoises: Sized + Send + Sync {
     /// Whether vein functions have interpolation channels.
     fn vein_interp_enabled() -> bool;
 
+    /// Interpolated channels that, when `<= 0` at all 8 corners of a cell,
+    /// prove the combined final density is not positive anywhere in the cell.
+    /// Derived by the transpiler from the final-density tree; `None` when no
+    /// such proof exists.
+    fn final_density_nonpositive_channels() -> Option<&'static [usize]>;
+
     /// Compute blended noise for an entire column of Y values.
     ///
     /// Called by `NoiseChunk::fill_slice` before iterating over Y corners.

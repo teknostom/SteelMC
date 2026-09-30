@@ -2,7 +2,7 @@
 //!
 //! Vanilla memoizes the level per `NoiseBasedAquifer` in a `Long2IntMap`, so
 //! every chunk re-evaluates the flat router for its own ~121-column scan and
-//! the columns `computeFluid` samples, most of which its neighbours already
+//! the columns `computeFluid` samples, most of which its neighbors already
 //! evaluated. The level is only ever evaluated at quart-aligned coordinates,
 //! where the column cache's grid and raw paths agree, so it is a pure function
 //! of the quart column and one generator-wide memo gives identical results.

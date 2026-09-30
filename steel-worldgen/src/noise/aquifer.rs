@@ -218,7 +218,7 @@ pub struct Aquifer<N: DimensionNoises> {
     col_cache: AquiferColumnCache,
     /// Generator-wide memo of `preliminary_surface_level`, replacing vanilla's
     /// per-aquifer `Long2IntMap`: `compute_fluid` samples 13 columns per cell
-    /// and the constructor scans ~121, mostly shared with neighbouring chunks.
+    /// and the constructor scans ~121, mostly shared with neighboring chunks.
     preliminary_surface: Arc<PreliminarySurfaceStore>,
 }
 
@@ -782,6 +782,22 @@ impl<N: DimensionNoises> Aquifer<N> {
         match fluid_at {
             Some(id) => AquiferResult::Fluid(id),
             None => AquiferResult::Air,
+        }
+    }
+
+    /// Lowest world Y from which [`Self::compute_substance`] returns `Air` for
+    /// every non-positive density without sampling the aquifer. Callers may
+    /// skip such blocks entirely: the only state that call would touch is the
+    /// fluid-update flag, which every call reassigns before it is read.
+    #[must_use]
+    pub fn unsampled_air_min_y(&self) -> i32 {
+        // The global fluid picker places fluid only below its level: lava below
+        // `LAVA_LEVEL` (under `lava_floor <= sea_level`), otherwise the default
+        // fluid below `sea_level`.
+        if N::Settings::AQUIFERS_ENABLED {
+            self.sea_level.max(self.skip_sampling_above_y + 1)
+        } else {
+            self.sea_level
         }
     }
 

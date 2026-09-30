@@ -989,6 +989,11 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
             }
 
             #[inline]
+            fn final_density_nonpositive_channels() -> Option<&'static [usize]> {
+                FINAL_DENSITY_NONPOSITIVE_CHANNELS
+            }
+
+            #[inline]
             fn compute_noise_column(&self, x: i32, block_ys: &[i32], z: i32, out: &mut [f64]) {
                 self.blended_noise.compute_column(x, block_ys, z, out);
             }

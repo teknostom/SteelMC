@@ -41,8 +41,8 @@ use steel_worldgen::biomes::obfuscate_biome_seed;
 use steel_worldgen::noise::Beardifier;
 use steel_worldgen::noise::NoiseChunk;
 use steel_worldgen::noise::OreVeinifier;
-use steel_worldgen::noise::PreliminarySurfaceStore;
 use steel_worldgen::noise::{Aquifer, AquiferResult, LazyAquifer, preliminary_surface_level};
+use steel_worldgen::noise::{CornerColumnStore, PreliminarySurfaceStore};
 use steel_worldgen::structure::GenerationContext;
 
 const CARVER_SOURCE_CHUNK_COUNT: usize = 17 * 17;
@@ -132,6 +132,9 @@ pub struct VanillaGenerator<N: DimensionNoises> {
     splitter: RandomSplitter,
     /// Preliminary surface levels shared by every aquifer this generator builds.
     preliminary_surface: Arc<PreliminarySurfaceStore>,
+    /// Noise cell-corner columns on chunk boundaries, handed to the neighbors
+    /// that share them.
+    corner_columns: CornerColumnStore,
     /// Ore vein generator for replacing stone with ore blocks.
     ore_veinifier: Option<OreVeinifier>,
     /// Surface system for biome-specific block replacement.
@@ -226,6 +229,7 @@ impl<N: DimensionNoises> VanillaGenerator<N> {
             noises: Box::new(noises),
             splitter,
             preliminary_surface: Arc::default(),
+            corner_columns: CornerColumnStore::default(),
             ore_veinifier,
             surface_system,
             surface_extension_biomes,
@@ -450,10 +454,13 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
         let mut world_surface_wg =
             Heightmap::new(HeightmapType::WorldSurfaceWg, min_y, N::Settings::HEIGHT);
 
+        let unsampled_air_min_y = aquifer.unsampled_air_min_y();
         noise_chunk.fill(
             noises,
             &mut column_cache,
             beardifier,
+            unsampled_air_min_y,
+            &self.corner_columns,
             |local_x, world_y, local_z, density, interpolated, cache| {
                 // Flush when we move to a new column
                 if local_x != prev_x || local_z != prev_z {

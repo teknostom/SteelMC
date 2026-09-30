@@ -10,6 +10,7 @@
 mod aquifer;
 mod beardifier;
 mod blended_noise;
+mod corner_column_store;
 mod end_islands;
 mod improved_noise;
 mod noise_chunk;
@@ -23,6 +24,7 @@ mod simplex_noise;
 pub use aquifer::{Aquifer, AquiferResult, LazyAquifer, preliminary_surface_level};
 pub use beardifier::Beardifier;
 pub use blended_noise::BlendedNoise;
+pub use corner_column_store::CornerColumnStore;
 pub use end_islands::EndIslands;
 pub use improved_noise::ImprovedNoise;
 pub use noise_chunk::NoiseChunk;
