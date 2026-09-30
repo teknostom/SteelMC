@@ -163,6 +163,8 @@ struct AquiferColumnCache {
     cell_xz_dist_sq: [i32; 16],
     /// Per-cell index into `location_cache` / `status_cache`.
     cell_idx: [u32; 12],
+    /// The shared status when all 12 cells have the same one.
+    uniform_status: Option<FluidStatus>,
 }
 
 impl Default for AquiferColumnCache {
@@ -174,6 +176,7 @@ impl Default for AquiferColumnCache {
             cell_loc_y: [0; 16],
             cell_xz_dist_sq: [0; 16],
             cell_idx: [0; 12],
+            uniform_status: None,
         }
     }
 }
@@ -507,6 +510,33 @@ impl<N: DimensionNoises> Aquifer<N> {
     /// Iterates the same `(x1, y1, z1)` order as the inline scan so cells are
     /// stored at consistent indices, preserving tie-breaking when the per-Y
     /// `new_dist` values are compared in `compute_substance`.
+    /// The status of the 12 cached neighborhood cells if they all agree.
+    fn uniform_cell_status(&mut self, noises: &N) -> Option<FluidStatus> {
+        let first = self.get_aquifer_status(self.col_cache.cell_idx[0] as usize, noises);
+        for i in 1..12 {
+            let index = self.col_cache.cell_idx[i] as usize;
+            if self.get_aquifer_status(index, noises) != first {
+                return None;
+            }
+        }
+        Some(first)
+    }
+
+    /// Whether `fluid_at` is water directly above the global lava sea.
+    fn is_water_over_global_lava(&self, fluid_at: Option<BlockStateId>, world_y: i32) -> bool {
+        if fluid_at != Some(self.water_id) {
+            return false;
+        }
+        let below = global_fluid(
+            world_y - 1,
+            self.lava_floor,
+            self.sea_level,
+            self.lava_id,
+            self.default_fluid_id,
+        );
+        below.fluid_type == self.lava_id && (world_y - 1) < below.fluid_level
+    }
+
     fn refill_col_cache(&mut self, world_x: i32, world_y: i32, world_z: i32) -> i32 {
         let x_anchor = grid_x(world_x + SAMPLE_OFFSET_X);
         let y_anchor = grid_y(world_y + SAMPLE_OFFSET_Y);
@@ -552,10 +582,6 @@ impl<N: DimensionNoises> Aquifer<N> {
     }
 
     /// Compute what block to place at this position given the interpolated density.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "splitting would hurt readability of the aquifer sampling logic"
-    )]
     pub fn compute_substance(
         &mut self,
         noises: &N,
@@ -620,8 +646,43 @@ impl<N: DimensionNoises> Aquifer<N> {
             || self.col_cache.y_anchor != y_anchor
         {
             self.refill_col_cache(world_x, world_y, world_z);
+            self.col_cache.uniform_status = self.uniform_cell_status(noises);
         }
 
+        // When all 12 candidate cells share one status, the 4 nearest do too,
+        // and every remaining branch collapses to that status with no fluid
+        // update: equal statuses give zero barrier pressure (the barrier noise
+        // is never sampled) and no flow between cells. Water over global lava
+        // is the one branch that differs, so it takes the full path.
+        if let Some(status) = self.col_cache.uniform_status {
+            let fluid_at = status.at(world_y);
+            if !self.is_water_over_global_lava(fluid_at, world_y) {
+                self.should_schedule_fluid_update = false;
+                return match fluid_at {
+                    Some(id) => AquiferResult::Fluid(id),
+                    None => AquiferResult::Air,
+                };
+            }
+        }
+
+        self.compute_substance_sampled(noises, world_x, world_y, world_z, density)
+    }
+
+    /// Nearest-cell selection and barrier evaluation for a block whose column
+    /// cache is current. Matches the remainder of vanilla's
+    /// `NoiseBasedAquifer.computeSubstance`.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "splitting would hurt readability of the aquifer sampling logic"
+    )]
+    fn compute_substance_sampled(
+        &mut self,
+        noises: &N,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        density: f64,
+    ) -> AquiferResult {
         // SIMD-batch the per-cell distance computation: `loc_y - world_y` then
         // `xz_dist_sq + dy²`, processing 4 cells per `i32x4` op. The 12 valid
         // cells fit in 3 batches; the 4-slot tail of `cell_loc_y` /
@@ -695,19 +756,10 @@ impl<N: DimensionNoises> Aquifer<N> {
 
         // Water adjacent to global lava below → return water
         if let Some(id) = fluid_at
-            && id == self.water_id
+            && self.is_water_over_global_lava(fluid_at, world_y)
         {
-            let below = global_fluid(
-                world_y - 1,
-                self.lava_floor,
-                self.sea_level,
-                self.lava_id,
-                self.default_fluid_id,
-            );
-            if below.fluid_type == self.lava_id && (world_y - 1) < below.fluid_level {
-                self.should_schedule_fluid_update = true;
-                return AquiferResult::Fluid(id);
-            }
+            self.should_schedule_fluid_update = true;
+            return AquiferResult::Fluid(id);
         }
 
         // Compute barrier pressure between closest pairs
@@ -1081,4 +1133,82 @@ pub fn preliminary_surface_level<N: DimensionNoises>(
     noises
         .router_preliminary_surface_level(cache, qx, 0, qz)
         .floor() as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use steel_utils::random::{Random, xoroshiro::Xoroshiro};
+
+    use super::{Aquifer, AquiferResult, SAMPLE_OFFSET_Y, grid_y};
+    use crate::density::DimensionNoises;
+    use crate::density_functions::overworld::OverworldNoises;
+    use crate::noise::PreliminarySurfaceStore;
+    use crate::noise_parameters::get_noise_parameters;
+
+    fn outcome(result: &AquiferResult) -> (u8, u16) {
+        match result {
+            AquiferResult::Solid => (0, 0),
+            AquiferResult::Air => (1, 0),
+            AquiferResult::Fluid(id) => (2, id.0),
+        }
+    }
+
+    /// Wherever the uniform-status shortcut answers, the full nearest-cell and
+    /// barrier path must give the same block and fluid-update flag.
+    #[test]
+    fn uniform_status_shortcut_matches_sampled_path() {
+        type Settings = <OverworldNoises as DimensionNoises>::Settings;
+        steel_registry::init_vanilla_registry();
+        let seed = 1;
+        let splitter = Xoroshiro::from_seed(seed).next_positional();
+        let noises = OverworldNoises::create(seed, &splitter, &get_noise_parameters());
+        let store = Arc::new(PreliminarySurfaceStore::default());
+
+        let (mut shortcut, mut compared) = (0, 0);
+        for (chunk_x, chunk_z) in [(0, 0), (-9, 4), (37, -21), (-150, 88)] {
+            let (min_x, min_z) = (chunk_x * 16, chunk_z * 16);
+            let mut cache = <OverworldNoises as DimensionNoises>::ColumnCache::default();
+            cache.init_grid(min_x, min_z, &noises);
+            let mut aquifer = Aquifer::<OverworldNoises>::new(
+                min_x,
+                min_z,
+                Settings::MIN_Y,
+                Settings::HEIGHT,
+                &splitter,
+                &noises,
+                &store,
+                cache,
+            );
+            for x in min_x..min_x + 16 {
+                for z in min_z..min_z + 16 {
+                    for y in (Settings::MIN_Y..Settings::MIN_Y + Settings::HEIGHT).rev() {
+                        for density in [-0.3, -0.004] {
+                            let result = aquifer.compute_substance(&noises, x, y, z, density);
+                            let flag = aquifer.should_schedule_fluid_update();
+                            let cache = &aquifer.col_cache;
+                            let current = cache.world_x == x
+                                && cache.world_z == z
+                                && cache.y_anchor == grid_y(y + SAMPLE_OFFSET_Y);
+                            if !current || cache.uniform_status.is_none() {
+                                continue;
+                            }
+                            shortcut += 1;
+                            let sampled =
+                                aquifer.compute_substance_sampled(&noises, x, y, z, density);
+                            assert_eq!(
+                                (outcome(&result), flag),
+                                (outcome(&sampled), aquifer.should_schedule_fluid_update()),
+                                "block ({x}, {y}, {z}) density {density}"
+                            );
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(shortcut > 0, "shortcut never applied");
+        assert_eq!(shortcut, compared);
+    }
 }
