@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::{cell::Cell, marker::PhantomData};
 
 use glam::{DVec3, IVec3};
@@ -40,6 +41,7 @@ use steel_worldgen::biomes::obfuscate_biome_seed;
 use steel_worldgen::noise::Beardifier;
 use steel_worldgen::noise::NoiseChunk;
 use steel_worldgen::noise::OreVeinifier;
+use steel_worldgen::noise::PreliminarySurfaceStore;
 use steel_worldgen::noise::{Aquifer, AquiferResult, LazyAquifer, preliminary_surface_level};
 use steel_worldgen::structure::GenerationContext;
 
@@ -128,6 +130,8 @@ pub struct VanillaGenerator<N: DimensionNoises> {
     noises: Box<N>,
     /// Seed positional splitter for per-chunk construction of aquifers.
     splitter: RandomSplitter,
+    /// Preliminary surface levels shared by every aquifer this generator builds.
+    preliminary_surface: Arc<PreliminarySurfaceStore>,
     /// Ore vein generator for replacing stone with ore blocks.
     ore_veinifier: Option<OreVeinifier>,
     /// Surface system for biome-specific block replacement.
@@ -221,6 +225,7 @@ impl<N: DimensionNoises> VanillaGenerator<N> {
             uniform_carver_biome,
             noises: Box::new(noises),
             splitter,
+            preliminary_surface: Arc::default(),
             ore_veinifier,
             surface_system,
             surface_extension_biomes,
@@ -323,7 +328,13 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
         // use their own caches, and the 1–4 column probes of the remainder
         // hit this cache's lazy single-entry mode cheaply. Eager 5×5 quart
         // init cost ~36µs per chunk with no payoff.
-        let mut aquifer = LazyAquifer::new(chunk_min_x, chunk_min_z, &self.splitter, &*self.noises);
+        let mut aquifer = LazyAquifer::new(
+            chunk_min_x,
+            chunk_min_z,
+            &self.splitter,
+            &*self.noises,
+            &self.preliminary_surface,
+        );
         let mut surface_y_cache: Option<i32> = None;
         let mut height_cache_grid_ready = false;
         let mut ctx = GenerationContext::<'_, '_, N>::new(
@@ -333,6 +344,7 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
             sea_level,
             &self.noises,
             &self.splitter,
+            &self.preliminary_surface,
             self.structure_generator.template_pools(),
             self.structure_generator.templates(),
             &mut sampler,
@@ -423,6 +435,7 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
             height,
             &self.splitter,
             noises,
+            &self.preliminary_surface,
             // Aquifer samples at arbitrary (x,z) outside the chunk, so it needs its own cache
             column_cache.clone(),
         );
@@ -799,6 +812,7 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                     height,
                     &self.splitter,
                     noises,
+                    &self.preliminary_surface,
                     column_cache,
                 ))
             };

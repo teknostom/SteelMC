@@ -8,10 +8,10 @@
 //! walls between fluid pockets.
 
 use std::simd::i32x4;
-
-use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 use crate::density::{ColumnCache, DimensionNoises, NoiseSettings};
+use crate::noise::PreliminarySurfaceStore;
 use steel_math::{clamp, map, map_clamped};
 use steel_registry::{REGISTRY, vanilla_blocks};
 use steel_utils::BlockStateId;
@@ -25,6 +25,7 @@ pub struct LazyAquifer<'a, N: DimensionNoises> {
     chunk_min_z: i32,
     splitter: &'a RandomSplitter,
     noises: &'a N,
+    preliminary_surface: &'a Arc<PreliminarySurfaceStore>,
     inner: Option<Aquifer<N>>,
 }
 
@@ -36,12 +37,14 @@ impl<'a, N: DimensionNoises> LazyAquifer<'a, N> {
         chunk_min_z: i32,
         splitter: &'a RandomSplitter,
         noises: &'a N,
+        preliminary_surface: &'a Arc<PreliminarySurfaceStore>,
     ) -> Self {
         Self {
             chunk_min_x,
             chunk_min_z,
             splitter,
             noises,
+            preliminary_surface,
             inner: None,
         }
     }
@@ -59,6 +62,7 @@ impl<'a, N: DimensionNoises> LazyAquifer<'a, N> {
                 <N::Settings as NoiseSettings>::HEIGHT,
                 self.splitter,
                 self.noises,
+                self.preliminary_surface,
                 height_cache.clone(),
             ));
         }
@@ -212,13 +216,10 @@ pub struct Aquifer<N: DimensionNoises> {
     /// Placed at the end so dimensions with disabled aquifers (nether/end)
     /// keep the hot fluid-id fields earlier in the struct's cache lines.
     col_cache: AquiferColumnCache,
-    /// Per-quart-column cache of `preliminary_surface_level` results, matching
-    /// vanilla's `NoiseBasedAquifer.preliminarySurfaceLevel` `Long2IntMap`.
-    /// `compute_fluid` samples surface level 13× per aquifer cell, and each miss
-    /// recomputes the entire flat `NormalNoise` router for that column via
-    /// `cache.ensure`. Memoizing the `i32` result per column collapses that to
-    /// one evaluation per unique column for the chunk.
-    prelim_cache: FxHashMap<(i32, i32), i32>,
+    /// Generator-wide memo of `preliminary_surface_level`, replacing vanilla's
+    /// per-aquifer `Long2IntMap`: `compute_fluid` samples 13 columns per cell
+    /// and the constructor scans ~121, mostly shared with neighbouring chunks.
+    preliminary_surface: Arc<PreliminarySurfaceStore>,
 }
 
 // Grid coordinate conversions
@@ -330,6 +331,10 @@ impl<N: DimensionNoises> Aquifer<N> {
     /// `cache` should be a pre-initialized column cache for this chunk
     /// (avoids a redundant `init_grid` call).
     #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors vanilla's Aquifer constructor shape"
+    )]
     pub fn new(
         chunk_min_x: i32,
         chunk_min_z: i32,
@@ -337,6 +342,7 @@ impl<N: DimensionNoises> Aquifer<N> {
         y_block_size: i32,
         splitter: &RandomSplitter,
         noises: &N,
+        preliminary_surface: &Arc<PreliminarySurfaceStore>,
         cache: N::ColumnCache,
     ) -> Self {
         Self::new_sized(
@@ -348,6 +354,7 @@ impl<N: DimensionNoises> Aquifer<N> {
             y_block_size,
             splitter,
             noises,
+            preliminary_surface,
             cache,
         )
     }
@@ -367,6 +374,7 @@ impl<N: DimensionNoises> Aquifer<N> {
         y_block_size: i32,
         splitter: &RandomSplitter,
         noises: &N,
+        preliminary_surface: &Arc<PreliminarySurfaceStore>,
         mut cache: N::ColumnCache,
     ) -> Self {
         const AQUIFER_HASH: NameHash = NameHash::new("minecraft:aquifer");
@@ -400,7 +408,7 @@ impl<N: DimensionNoises> Aquifer<N> {
                 lava_id,
                 default_fluid_id,
                 should_schedule_fluid_update: false,
-                prelim_cache: FxHashMap::default(),
+                preliminary_surface: Arc::clone(preliminary_surface),
             };
         }
 
@@ -424,12 +432,11 @@ impl<N: DimensionNoises> Aquifer<N> {
         let status_cache = vec![None; total];
 
         // Compute skip_sampling_above_y from max preliminary surface level.
-        // The scan primes `prelim_cache` for the columns `compute_fluid` reuses.
-        let mut prelim_cache = FxHashMap::default();
+        // The scan primes the store for the columns `compute_fluid` reuses.
         let max_surface = Self::max_preliminary_surface_level(
             noises,
             &mut cache,
-            &mut prelim_cache,
+            preliminary_surface,
             from_grid_x(min_grid_x, 0),
             from_grid_z(min_grid_z, 0),
             from_grid_x(max_grid_x, X_RANGE - 1),
@@ -457,14 +464,14 @@ impl<N: DimensionNoises> Aquifer<N> {
             lava_id,
             default_fluid_id,
             should_schedule_fluid_update: false,
-            prelim_cache,
+            preliminary_surface: Arc::clone(preliminary_surface),
         }
     }
 
     fn max_preliminary_surface_level(
         noises: &N,
         cache: &mut N::ColumnCache,
-        prelim_cache: &mut FxHashMap<(i32, i32), i32>,
+        preliminary_surface: &PreliminarySurfaceStore,
         min_x: i32,
         min_z: i32,
         max_x: i32,
@@ -476,7 +483,7 @@ impl<N: DimensionNoises> Aquifer<N> {
         while z <= max_z {
             let mut x = min_x;
             while x <= max_x {
-                let level = cached_preliminary_surface_level(noises, cache, prelim_cache, x, z);
+                let level = preliminary_surface.level(noises, cache, x, z);
                 if level > max_level {
                     max_level = level;
                 }
@@ -785,9 +792,10 @@ impl<N: DimensionNoises> Aquifer<N> {
     }
 
     /// Returns the quart-quantized preliminary surface level, reusing this aquifer's
-    /// density-column and result caches.
+    /// density-column cache and the generator-wide result store.
     pub fn preliminary_surface_level(&mut self, noises: &N, x: i32, z: i32) -> i32 {
-        cached_preliminary_surface_level(noises, &mut self.cache, &mut self.prelim_cache, x, z)
+        self.preliminary_surface
+            .level(noises, &mut self.cache, x, z)
     }
 
     /// Get or compute the fluid status for the aquifer cell at the given cache index.
@@ -823,13 +831,9 @@ impl<N: DimensionNoises> Aquifer<N> {
             let sx = x + offset[0] * 16; // sectionToBlockCoord
             let sz = z + offset[1] * 16;
 
-            let preliminary = cached_preliminary_surface_level(
-                noises,
-                &mut self.cache,
-                &mut self.prelim_cache,
-                sx,
-                sz,
-            );
+            let preliminary = self
+                .preliminary_surface
+                .level(noises, &mut self.cache, sx, sz);
             let adjusted = preliminary + 8;
 
             let is_center = offset[0] == 0 && offset[1] == 0;
@@ -1061,24 +1065,4 @@ pub fn preliminary_surface_level<N: DimensionNoises>(
     noises
         .router_preliminary_surface_level(cache, qx, 0, qz)
         .floor() as i32
-}
-
-/// [`preliminary_surface_level`] with a per-quart-column result cache (vanilla's
-/// `Long2IntMap`). On a hit it returns the memoized `i32` and skips the
-/// expensive flat-router recompute in `cache.ensure`. Bit-identical: the cached
-/// value is the same deterministic function of the quart column.
-fn cached_preliminary_surface_level<N: DimensionNoises>(
-    noises: &N,
-    cache: &mut N::ColumnCache,
-    prelim_cache: &mut FxHashMap<(i32, i32), i32>,
-    x: i32,
-    z: i32,
-) -> i32 {
-    let key = ((x >> 2) << 2, (z >> 2) << 2);
-    if let Some(&level) = prelim_cache.get(&key) {
-        return level;
-    }
-    let level = preliminary_surface_level(noises, cache, x, z);
-    prelim_cache.insert(key, level);
-    level
 }

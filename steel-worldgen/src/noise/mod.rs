@@ -17,6 +17,7 @@ mod normal_noise;
 mod ore_veinifier;
 mod perlin_noise;
 mod perlin_simplex_noise;
+mod preliminary_surface_store;
 mod simplex_noise;
 
 pub use aquifer::{Aquifer, AquiferResult, LazyAquifer, preliminary_surface_level};
@@ -29,4 +30,5 @@ pub use normal_noise::NormalNoise;
 pub use ore_veinifier::OreVeinifier;
 pub use perlin_noise::PerlinNoise;
 pub use perlin_simplex_noise::PerlinSimplexNoise;
+pub use preliminary_surface_store::PreliminarySurfaceStore;
 pub use simplex_noise::SimplexNoise;
