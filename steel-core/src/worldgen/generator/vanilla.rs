@@ -47,6 +47,7 @@ use steel_worldgen::noise::OreVeinifier;
 use steel_worldgen::noise::{Aquifer, AquiferResult, LazyAquifer, preliminary_surface_level};
 use steel_worldgen::noise::{CornerColumnStore, PreliminarySurfaceStore};
 use steel_worldgen::structure::GenerationContext;
+use steel_worldgen::surface_partial::PartialSurfaceOutcome;
 
 const CARVER_SOURCE_CHUNK_COUNT: usize = 17 * 17;
 
@@ -724,6 +725,27 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
 
                     // Only apply surface rules to the default block
                     if state == default_block_id {
+                        // Below the preliminary surface the rule is mostly
+                        // decided by Y and biome class; run it only when not.
+                        let outcome =
+                            if y < min_surface_level && preliminary_surface_corners.is_some() {
+                                biome_col
+                                    .as_mut()
+                                    .map_or(PartialSurfaceOutcome::Evaluate, |col| {
+                                        col.below_preliminary_outcome(y)
+                                    })
+                            } else {
+                                PartialSurfaceOutcome::Evaluate
+                            };
+                        match outcome {
+                            PartialSurfaceOutcome::Keep => continue,
+                            PartialSurfaceOutcome::Place(index) => {
+                                pending_writes.push((relative_y, surface_rule_block_states[index]));
+                                continue;
+                            }
+                            PartialSurfaceOutcome::Evaluate => {}
+                        }
+
                         let eager_biome_id = if surface_rule_uses_biome && !lazy_surface_rule_biome
                         {
                             biome_col

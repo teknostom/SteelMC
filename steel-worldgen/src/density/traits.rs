@@ -9,6 +9,7 @@ use std::simd::f64x4;
 use crate::BlockStateId;
 use crate::random::RandomSplitter;
 use crate::surface::SurfaceRuleContext;
+use crate::surface_partial::PartialSurfaceRule;
 use rustc_hash::FxHashMap;
 
 use super::NoiseParameters;
@@ -277,6 +278,10 @@ pub trait DimensionNoises: Sized + Send + Sync {
     /// registry ids. Together with a biome's temperature parameters these are
     /// everything the rule can observe about a biome.
     fn surface_rule_biome_sets() -> &'static [Box<[u16]>];
+
+    /// The surface rule reduced to what is decidable from Y and biome below the
+    /// preliminary surface.
+    fn surface_rule_below_preliminary_surface() -> &'static PartialSurfaceRule;
 
     /// Whether the generated surface rule reads preliminary surface level.
     fn surface_rule_uses_preliminary_surface() -> bool;

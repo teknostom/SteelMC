@@ -12,14 +12,20 @@ use glam::IVec3;
 use rustc_hash::FxHashMap;
 use steel_registry::REGISTRY;
 use steel_registry::biome::TemperatureModifier;
-use steel_worldgen::density::DimensionNoises;
+use steel_worldgen::density::{DimensionNoises, NoiseSettings};
 use steel_worldgen::surface::SurfaceBiomeProvider;
+use steel_worldgen::surface_partial::PartialSurfaceOutcome;
 
 use super::vanilla::{get_fiddle, lcg_next};
 
 /// Partition of biome ids into classes the surface rule cannot tell apart.
 pub(super) struct SurfaceBiomeClasses {
     class_of: Box<[u16]>,
+    /// Rule outcome below the preliminary surface, `[class][y - min_y]`;
+    /// empty when the rule does not use the preliminary surface.
+    below_preliminary: Box<[PartialSurfaceOutcome]>,
+    min_y: i32,
+    height: i32,
 }
 
 impl SurfaceBiomeClasses {
@@ -33,6 +39,7 @@ impl SurfaceBiomeClasses {
         }
 
         let mut classes = FxHashMap::<(u64, u32, bool), u16>::default();
+        let mut class_masks = Vec::new();
         let class_of = REGISTRY
             .biomes
             .iter()
@@ -48,14 +55,42 @@ impl SurfaceBiomeClasses {
                     matches!(biome.temperature_modifier, TemperatureModifier::Frozen),
                 );
                 let next = classes.len() as u16;
-                *classes.entry(key).or_insert(next)
+                *classes.entry(key).or_insert_with(|| {
+                    class_masks.push(mask);
+                    next
+                })
             })
             .collect();
-        Some(Self { class_of })
+
+        let min_y = N::Settings::MIN_Y;
+        let height = N::Settings::HEIGHT;
+        let below_preliminary = if N::surface_rule_uses_preliminary_surface() {
+            let rule = N::surface_rule_below_preliminary_surface();
+            class_masks
+                .iter()
+                .flat_map(|&mask| (min_y..min_y + height).map(move |y| rule.resolve(y, mask)))
+                .collect()
+        } else {
+            Box::default()
+        };
+        Some(Self {
+            class_of,
+            below_preliminary,
+            min_y,
+            height,
+        })
     }
 
     fn class(&self, biome_id: u16) -> Option<u16> {
         self.class_of.get(usize::from(biome_id)).copied()
+    }
+
+    fn below_preliminary_outcome(&self, class: u16, block_y: i32) -> PartialSurfaceOutcome {
+        let index = usize::from(class) * self.height as usize + (block_y - self.min_y) as usize;
+        self.below_preliminary
+            .get(index)
+            .copied()
+            .unwrap_or(PartialSurfaceOutcome::Evaluate)
     }
 }
 
@@ -276,18 +311,35 @@ impl<'a, 'b> FuzzedBiomeColumn<'a, 'b> {
     /// [`SurfaceBiomeClasses`] class, any of them is equivalent to the fuzzed
     /// choice, so the fiddle and distance evaluation are skipped.
     pub(super) fn get_for_surface_rule(&mut self, block_y: i32) -> u16 {
+        match self.uniform_group_biome(block_y) {
+            Some(biome) => biome,
+            None => self.get(block_y),
+        }
+    }
+
+    /// What the surface rule does to a default block at `block_y`, known to be
+    /// below the column's preliminary surface, when decidable from Y and the
+    /// biome class of a uniform candidate group alone.
+    pub(super) fn below_preliminary_outcome(&mut self, block_y: i32) -> PartialSurfaceOutcome {
         let Some(classes) = self.classes else {
-            return self.get(block_y);
+            return PartialSurfaceOutcome::Evaluate;
         };
+        self.uniform_group_biome(block_y)
+            .and_then(|biome| classes.class(biome))
+            .map_or(PartialSurfaceOutcome::Evaluate, |class| {
+                classes.below_preliminary_outcome(class, block_y)
+            })
+    }
+
+    /// The group's shared-class candidate biome, if its 8 candidates agree.
+    fn uniform_group_biome(&mut self, block_y: i32) -> Option<u16> {
+        let classes = self.classes?;
         let parent_y = (block_y - 2) >> 2;
         if parent_y != self.class_parent_y {
             self.class_parent_y = parent_y;
             self.uniform_biome = self.uniform_candidate_biome(classes, parent_y);
         }
-        match self.uniform_biome {
-            Some(biome) => biome,
-            None => self.get(block_y),
-        }
+        self.uniform_biome
     }
 
     fn uniform_candidate_biome(
@@ -326,7 +378,96 @@ mod tests {
     use steel_registry::{RegistryEntry, init_vanilla_registry, vanilla_biomes};
     use steel_worldgen::density_functions::overworld::OverworldNoises;
 
+    use std::cell::Cell;
+
+    use steel_utils::random::{Random, xoroshiro::Xoroshiro};
+    use steel_worldgen::density::DimensionNoises;
+    use steel_worldgen::noise_parameters::get_noise_parameters;
+    use steel_worldgen::surface::{SurfaceConditionNoiseCache, SurfaceRuleContext};
+    use steel_worldgen::surface_partial::PartialSurfaceOutcome;
+
     use super::{FuzzedBiomeColumn, SurfaceBiomeClasses, SurfaceQuartBiomes};
+    use crate::worldgen::surface::SurfaceSystem;
+
+    /// Wherever the below-preliminary-surface table decides a block, the full
+    /// generated rule must agree, whatever the column context.
+    #[test]
+    fn below_preliminary_table_matches_full_rule() {
+        type N = OverworldNoises;
+        type Settings = <N as DimensionNoises>::Settings;
+        init_vanilla_registry();
+        let classes = SurfaceBiomeClasses::new::<N>().expect("overworld reads biomes");
+        let splitter = Xoroshiro::from_seed(5).next_positional();
+        let system = SurfaceSystem::new(
+            &splitter,
+            &get_noise_parameters(),
+            N::surface_noise_ids(),
+            N::surface_gradient_ids(),
+            Settings::default_block_id(),
+            Settings::SEA_LEVEL,
+        );
+        let block_states = N::surface_rule_block_states();
+        let noise_values: Vec<_> = N::surface_noise_ids()
+            .iter()
+            .map(|_| Cell::new(0.0))
+            .collect();
+        let noise_ready: Vec<_> = N::surface_noise_ids()
+            .iter()
+            .map(|_| Cell::new(false))
+            .collect();
+
+        let mut random = Xoroshiro::from_seed(11);
+        let (mut decided, mut evaluated) = (0, 0);
+        for (biome_id, _) in steel_registry::REGISTRY.biomes.iter() {
+            let biome_id = biome_id as u16;
+            let class = classes.class(biome_id).expect("every biome has a class");
+            for y in Settings::MIN_Y..Settings::MIN_Y + Settings::HEIGHT {
+                let outcome = classes.below_preliminary_outcome(class, y);
+                let expected = match outcome {
+                    PartialSurfaceOutcome::Keep => None,
+                    PartialSurfaceOutcome::Place(index) => Some(block_states[index]),
+                    PartialSurfaceOutcome::Evaluate => {
+                        evaluated += 1;
+                        continue;
+                    }
+                };
+                decided += 1;
+                for _ in 0..3 {
+                    let noise_cache = SurfaceConditionNoiseCache::new(&noise_values, &noise_ready);
+                    let mut ctx = SurfaceRuleContext::new(
+                        random.next_i32_bounded(4000) - 2000,
+                        random.next_i32_bounded(4000) - 2000,
+                        random.next_i32_bounded(8) + 1,
+                        random.next_f64() * 2.0 - 1.0,
+                        y + 1 + random.next_i32_bounded(40),
+                        random.next_i32_bounded(2) == 0,
+                        y,
+                        random.next_i32_bounded(20),
+                        random.next_i32_bounded(20),
+                        if random.next_i32_bounded(2) == 0 {
+                            i32::MIN
+                        } else {
+                            y + random.next_i32_bounded(30)
+                        },
+                        Some(biome_id),
+                        None,
+                        &system,
+                        &noise_cache,
+                        block_states,
+                    );
+                    assert_eq!(
+                        N::try_apply_surface_rule(&mut ctx),
+                        expected,
+                        "biome {biome_id} y {y}"
+                    );
+                }
+            }
+        }
+        assert!(
+            decided > 0 && evaluated > 0,
+            "decided={decided} evaluated={evaluated}"
+        );
+    }
 
     /// The rule-path biome must always be in the exact fuzzed biome's class,
     /// both inside the chunk and across its edges (ring reads).

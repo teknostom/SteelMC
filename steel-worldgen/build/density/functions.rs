@@ -720,6 +720,7 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
         surface_gradient_ids_tokens,
         surface_block_states_tokens,
         surface_biome_sets_tokens,
+        surface_partial_rule_tokens,
         surface_rule_uses_biome,
         surface_rule_uses_preliminary_surface,
         surface_rule_uses_surface_secondary,
@@ -769,6 +770,7 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
                     BIOME_SETS.get_or_init(|| Box::from([#(#biome_set_tokens),*]))
                 }
             },
+            artifacts.partial_rule,
             artifacts.uses_biome,
             artifacts.uses_preliminary_surface,
             artifacts.uses_surface_secondary,
@@ -790,6 +792,7 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
             quote! { &[] },
             quote! { &[] },
             quote! { &[] },
+            quote! { steel_worldgen::surface_partial::PartialSurfaceRule::Sequence(&[]) },
             false,
             false,
             false,
@@ -1061,6 +1064,14 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
 
             fn surface_rule_biome_sets() -> &'static [Box<[u16]>] {
                 #surface_biome_sets_tokens
+            }
+
+            fn surface_rule_below_preliminary_surface()
+                -> &'static steel_worldgen::surface_partial::PartialSurfaceRule
+            {
+                static RULE: steel_worldgen::surface_partial::PartialSurfaceRule =
+                    #surface_partial_rule_tokens;
+                &RULE
             }
 
             fn surface_rule_uses_preliminary_surface() -> bool {

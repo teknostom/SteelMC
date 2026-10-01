@@ -412,6 +412,81 @@ impl SurfaceRuleTranspiler {
     }
 }
 
+impl SurfaceRuleTranspiler {
+    /// Emit the rule as a `PartialSurfaceRule`, keeping only conditions
+    /// decidable from Y and biome below the preliminary surface. Must run after
+    /// [`Self::transpile_rule`], whose block and biome-set indices it reuses.
+    fn partial_rule(&self, rule: &SurfaceRuleJson) -> TokenStream {
+        let path = quote! { steel_worldgen::surface_partial::PartialSurfaceRule };
+        match rule {
+            SurfaceRuleJson::Block { result_state } => {
+                let name = result_state.name.as_str();
+                let Some(index) = self.block_state_names.iter().position(|n| n == name) else {
+                    panic!("surface rule block {name} was not transpiled");
+                };
+                quote! { #path::Block(#index) }
+            }
+            SurfaceRuleJson::Sequence { sequence } => {
+                let rules = sequence.iter().map(|rule| self.partial_rule(rule));
+                quote! { #path::Sequence(&[#(#rules),*]) }
+            }
+            SurfaceRuleJson::Condition { if_true, then_run } => {
+                let condition = self.partial_condition(if_true);
+                let then_run = self.partial_rule(then_run);
+                quote! { #path::Condition(#condition, &#then_run) }
+            }
+            SurfaceRuleJson::Bandlands {} => quote! { #path::Opaque },
+        }
+    }
+
+    fn partial_condition(&self, condition: &SurfaceConditionJson) -> TokenStream {
+        let path = quote! { steel_worldgen::surface_partial::PartialSurfaceCondition };
+        match condition {
+            SurfaceConditionJson::AbovePreliminarySurface {} => {
+                quote! { #path::AbovePreliminarySurface }
+            }
+            SurfaceConditionJson::BiomeIs { biome_is } => {
+                let set: Vec<String> = biome_is
+                    .as_slice()
+                    .iter()
+                    .map(|b| b.as_str().to_owned())
+                    .collect();
+                let Some(index) = self.biome_sets.iter().position(|s| *s == set) else {
+                    panic!("surface rule biome set {set:?} was not transpiled");
+                };
+                quote! { #path::BiomeSet(#index) }
+            }
+            SurfaceConditionJson::VerticalGradient {
+                true_at_and_below,
+                false_at_and_above,
+                ..
+            } => {
+                let true_y = self.resolve_anchor(true_at_and_below);
+                let false_y = self.resolve_anchor(false_at_and_above);
+                quote! {
+                    #path::VerticalGradient {
+                        true_at_and_below: #true_y,
+                        false_at_and_above: #false_y,
+                    }
+                }
+            }
+            SurfaceConditionJson::YAbove {
+                anchor,
+                surface_depth_multiplier: 0,
+                add_stone_depth: false,
+            } => {
+                let anchor_y = self.resolve_anchor(anchor);
+                quote! { #path::YAtLeast(#anchor_y) }
+            }
+            SurfaceConditionJson::Not { invert } => {
+                let inner = self.partial_condition(invert);
+                quote! { #path::Not(&#inner) }
+            }
+            _ => quote! { #path::Opaque },
+        }
+    }
+}
+
 fn rule_uses_preliminary_surface(rule: &SurfaceRuleJson) -> bool {
     match rule {
         SurfaceRuleJson::Block { .. } | SurfaceRuleJson::Bandlands {} => false,
@@ -452,6 +527,8 @@ pub struct SurfaceRuleArtifacts {
     pub block_state_names: Vec<String>,
     /// Distinct `biome_is` sets tested by the rule.
     pub biome_sets: Vec<Vec<String>>,
+    /// The rule as a `PartialSurfaceRule` expression.
+    pub partial_rule: TokenStream,
     pub uses_biome: bool,
     pub uses_preliminary_surface: bool,
     pub uses_surface_secondary: bool,
@@ -467,6 +544,7 @@ pub fn generate_surface_rule_function(
     let uses_preliminary_surface = rule_uses_preliminary_surface(rule);
     let mut transpiler = SurfaceRuleTranspiler::new(min_y, height, uses_preliminary_surface);
     let body = transpiler.transpile_rule(rule);
+    let partial_rule = transpiler.partial_rule(rule);
 
     let func = quote! {
         /// Apply this dimension's surface rule at the current context position.
@@ -485,6 +563,7 @@ pub fn generate_surface_rule_function(
         gradient_ids: transpiler.gradient_ids,
         block_state_names: transpiler.block_state_names,
         biome_sets: transpiler.biome_sets,
+        partial_rule,
         uses_biome: transpiler.uses_biome,
         uses_preliminary_surface: transpiler.uses_preliminary_surface,
         uses_surface_secondary: transpiler.uses_surface_secondary,
