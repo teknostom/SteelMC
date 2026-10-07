@@ -323,3 +323,87 @@ fn block_bottom_center(pos: BlockPos) -> DVec3 {
     let (x, y, z) = pos.get_bottom_center();
     DVec3::new(x, y, z)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{fresh_test_world_with_dimension_type, insert_ready_full_chunk};
+    use steel_registry::dimension_type::DimensionTypeRef;
+    use steel_registry::vanilla_dimension_types;
+
+    const RESPAWN_RADIUS_FROM_ISSUE: i32 = 10;
+
+    /// Pre-loads every chunk the candidate square can touch, like a pregenerated
+    /// world, then counts how many ticks the search needs with all candidates rejected.
+    fn ticks_until_spawn_search_ready(
+        key: &'static str,
+        dimension_type: DimensionTypeRef,
+        ready_candidate_budget: usize,
+    ) -> (usize, i32) {
+        let world = fresh_test_world_with_dimension_type("test", key, dimension_type);
+        let _runtime_guard = world.chunk_map.chunk_runtime.enter();
+        assert!(world.set_game_rule(&RESPAWN_RADIUS, RESPAWN_RADIUS_FROM_ISSUE));
+        for z in -2..=2 {
+            for x in -2..=2 {
+                insert_ready_full_chunk(&world, ChunkPos::new(x, z));
+            }
+        }
+
+        let spawn_suggestion = BlockPos::new(0, 64, 0);
+        let mut search = PlayerSpawnSearch::new(&world, spawn_suggestion, GameType::Survival)
+            .expect("spawn search should initialize");
+        let candidate_count = search.candidate_count;
+
+        for tick in 1..=10_000 {
+            world.chunk_map.advance_scheduling();
+            match search.poll_with_ready_candidate_budget(&world, ready_candidate_budget) {
+                PlayerSpawnSearchPoll::Pending => {}
+                PlayerSpawnSearchPoll::Ready(_) => return (tick, candidate_count),
+                PlayerSpawnSearchPoll::Cancelled => panic!("spawn search was cancelled"),
+            }
+        }
+        panic!("spawn search did not finish");
+    }
+
+    #[test]
+    fn nether_spawn_search_with_loaded_chunks_takes_one_tick_per_rejected_candidate() {
+        let (ticks, candidate_count) = ticks_until_spawn_search_ready(
+            "nether_spawn_search_ticks",
+            &vanilla_dimension_types::THE_NETHER,
+            8,
+        );
+        eprintln!("nether: {ticks} ticks for {candidate_count} candidates (budget 8)");
+        assert!(
+            ticks <= 8,
+            "spawn search over loaded chunks took {ticks} ticks for {candidate_count} candidates"
+        );
+    }
+
+    #[test]
+    fn overworld_spawn_search_with_loaded_chunks_takes_one_tick_per_rejected_candidate() {
+        let (ticks, candidate_count) = ticks_until_spawn_search_ready(
+            "overworld_spawn_search_ticks",
+            &vanilla_dimension_types::OVERWORLD,
+            8,
+        );
+        eprintln!("overworld: {ticks} ticks for {candidate_count} candidates (budget 8)");
+        assert!(
+            ticks <= 8,
+            "spawn search over loaded chunks took {ticks} ticks for {candidate_count} candidates"
+        );
+    }
+
+    #[test]
+    fn unbounded_budget_spawn_search_with_loaded_chunks_tick_count() {
+        let (ticks, candidate_count) = ticks_until_spawn_search_ready(
+            "unbounded_spawn_search_ticks",
+            &vanilla_dimension_types::THE_NETHER,
+            usize::MAX,
+        );
+        eprintln!("nether unbounded budget: {ticks} ticks for {candidate_count} candidates");
+        assert!(
+            ticks <= 8,
+            "spawn search over loaded chunks took {ticks} ticks for {candidate_count} candidates"
+        );
+    }
+}
