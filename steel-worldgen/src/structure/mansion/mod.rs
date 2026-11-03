@@ -50,10 +50,11 @@ impl Structure for WoodlandMansionStructure {
         };
         let bx = ctx.chunk_min_x() + 7;
         let bz = ctx.chunk_min_z() + 7;
-        let h0 = ctx.base_height(bx, bz, false);
-        let h1 = ctx.base_height(bx, bz + off_z, false);
-        let h2 = ctx.base_height(bx + off_x, bz, false);
-        let h3 = ctx.base_height(bx + off_x, bz + off_z, false);
+        // `getLowestY` samples the first occupied height at the four corners.
+        let h0 = ctx.base_height(bx, bz, false) - 1;
+        let h1 = ctx.base_height(bx, bz + off_z, false) - 1;
+        let h2 = ctx.base_height(bx + off_x, bz, false) - 1;
+        let h3 = ctx.base_height(bx + off_x, bz + off_z, false) - 1;
         let lowest = h0.min(h1).min(h2).min(h3);
         if lowest < 60 {
             return None;

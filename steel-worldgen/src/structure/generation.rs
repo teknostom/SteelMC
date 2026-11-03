@@ -3,7 +3,6 @@ use crate::density::traits::{ColumnCache, NoiseSettings};
 use crate::noise::AquiferResult;
 use crate::noise::LazyAquifer;
 use crate::structure::StructurePiece;
-use crate::utils::column_base_height;
 use crate::utils::column_interpolated_density;
 use crate::utils::find_solid_block_below_air;
 use crate::utils::iterate_noise_column_with_aquifer;
@@ -146,8 +145,6 @@ pub trait StructureGenerationContext {
     fn templates(&self) -> &FxHashMap<Identifier, TemplateData>;
     /// Base height at a column.
     fn base_height(&mut self, x: i32, z: i32, ocean_floor: bool) -> i32;
-    /// Full-column base height scan.
-    fn base_height_full(&mut self, x: i32, z: i32, ocean_floor: bool) -> i32;
     /// Biome at a block position.
     fn biome_at(&mut self, block_x: i32, block_y: i32, block_z: i32) -> BiomeRef;
     /// Classify a block in the generator's base terrain.
@@ -238,16 +235,9 @@ where
     ///
     /// `ocean_floor=false` → opaque is Solid+Fluid; `true` → opaque is Solid only.
     ///
-    /// In dimensions with a constant `preliminary_surface_level` (End), use
-    /// [`base_height_full`](Self::base_height_full) instead.
+    /// Scans the whole column from the world top like vanilla's `iterateNoiseColumn`;
+    /// terrain can rise well above any cheaper surface estimate.
     pub fn base_height(&mut self, x: i32, z: i32, ocean_floor: bool) -> i32 {
-        self.ensure_height_cache_grid();
-        let aq = self.aquifer.ensure(self.height_cache);
-        column_base_height::<N>(self.height_cache, self.noises, aq, x, z, ocean_floor)
-    }
-
-    /// Full-column scan from chunk top. Matches vanilla's `iterateNoiseColumn`.
-    pub fn base_height_full(&mut self, x: i32, z: i32, ocean_floor: bool) -> i32 {
         self.ensure_height_cache_grid();
         let aq = self.aquifer.ensure(self.height_cache);
         iterate_noise_column_with_aquifer::<N>(
@@ -373,10 +363,6 @@ impl<N: DimensionNoises> StructureGenerationContext for GenerationContext<'_, '_
 
     fn base_height(&mut self, x: i32, z: i32, ocean_floor: bool) -> i32 {
         GenerationContext::base_height(self, x, z, ocean_floor)
-    }
-
-    fn base_height_full(&mut self, x: i32, z: i32, ocean_floor: bool) -> i32 {
-        GenerationContext::base_height_full(self, x, z, ocean_floor)
     }
 
     fn biome_at(&mut self, block_x: i32, block_y: i32, block_z: i32) -> BiomeRef {
