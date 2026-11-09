@@ -85,28 +85,23 @@ impl StructurePiecePlacer {
         Some(entity)
     }
 
-    /// Places one already-clipped structure piece.
+    /// Places a piece whose placement never mutates it, so it can run while
+    /// other chunks place pieces of the same start.
     ///
-    /// Returns whether the vanilla placement call succeeded. Later milestones
-    /// must implement each remaining payload variant completely before it can
-    /// return `true`.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "single dispatch boundary for all structure piece payload families"
-    )]
-    pub(crate) fn place_piece(
+    /// Returns `None` for payload kinds that mutate piece state during
+    /// placement (one-shot chest/spawner flags, height adjustment, bounding box
+    /// moves); those need [`Self::place_piece`] under exclusive access.
+    pub(crate) fn try_place_piece_shared(
         region: &mut WorldGenRegion<'_>,
         registry: &Registry,
-        piece: &mut StructurePiece,
+        piece: &StructurePiece,
         reference_pos: BlockPos,
         clip: BoundingBox,
         random: &mut WorldgenRandom,
         biome_zoom_seed: i64,
-    ) -> bool {
-        let mut piece_bounding_box = piece.bounding_box;
-        let piece_orientation = piece.orientation;
-        let placed = match &mut piece.payload {
-            StructurePiecePayload::Jigsaw(data) => Self::place_pool_element(
+    ) -> Option<bool> {
+        match &piece.payload {
+            StructurePiecePayload::Jigsaw(data) => Some(Self::place_pool_element(
                 region,
                 registry,
                 &data.pool_element,
@@ -117,7 +112,68 @@ impl StructurePiecePlacer {
                 random,
                 data.liquid_settings,
                 biome_zoom_seed,
-            ),
+            )),
+            StructurePiecePayload::Procedural(ProceduralPieceData::OceanMonument(data)) => {
+                Some(Self::place_ocean_monument_piece(
+                    region,
+                    registry,
+                    piece.bounding_box,
+                    piece.orientation,
+                    data,
+                    clip,
+                    random,
+                ))
+            }
+            StructurePiecePayload::Procedural(ProceduralPieceData::Unimplemented) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Whether [`Self::try_place_piece_shared`] can place this piece.
+    #[must_use]
+    pub(crate) const fn can_place_piece_shared(piece: &StructurePiece) -> bool {
+        matches!(
+            piece.payload,
+            StructurePiecePayload::Jigsaw(_)
+                | StructurePiecePayload::Procedural(
+                    ProceduralPieceData::OceanMonument(_) | ProceduralPieceData::Unimplemented
+                )
+        )
+    }
+
+    /// Places one already-clipped structure piece.
+    ///
+    /// Returns whether the vanilla placement call succeeded. Later milestones
+    /// must implement each remaining payload variant completely before it can
+    /// return `true`.
+    pub(crate) fn place_piece(
+        region: &mut WorldGenRegion<'_>,
+        registry: &Registry,
+        piece: &mut StructurePiece,
+        reference_pos: BlockPos,
+        clip: BoundingBox,
+        random: &mut WorldgenRandom,
+        biome_zoom_seed: i64,
+    ) -> bool {
+        if let Some(placed) = Self::try_place_piece_shared(
+            region,
+            registry,
+            piece,
+            reference_pos,
+            clip,
+            random,
+            biome_zoom_seed,
+        ) {
+            return placed;
+        }
+
+        let mut piece_bounding_box = piece.bounding_box;
+        let piece_orientation = piece.orientation;
+        let placed = match &mut piece.payload {
+            StructurePiecePayload::Jigsaw(_)
+            | StructurePiecePayload::Procedural(
+                ProceduralPieceData::OceanMonument(_) | ProceduralPieceData::Unimplemented,
+            ) => unreachable!("shared payload kinds are placed by try_place_piece_shared"),
             StructurePiecePayload::Template(data) => Self::place_template_piece(
                 region,
                 registry,
@@ -141,17 +197,6 @@ impl StructurePiecePlacer {
             }
             StructurePiecePayload::Procedural(ProceduralPieceData::NetherFortress(data)) => {
                 Self::place_nether_fortress_piece(
-                    region,
-                    registry,
-                    piece_bounding_box,
-                    piece_orientation,
-                    data,
-                    clip,
-                    random,
-                )
-            }
-            StructurePiecePayload::Procedural(ProceduralPieceData::OceanMonument(data)) => {
-                Self::place_ocean_monument_piece(
                     region,
                     registry,
                     piece_bounding_box,
@@ -208,10 +253,15 @@ impl StructurePiecePlacer {
                     random,
                 )
             }
-            StructurePiecePayload::Procedural(ProceduralPieceData::Unimplemented) => false,
         };
         piece.bounding_box = piece_bounding_box;
         placed
+    }
+
+    /// Whether [`Self::after_place_structure`] mutates this structure's pieces.
+    #[must_use]
+    pub(crate) fn has_after_place(structure: StructureRef) -> bool {
+        structure.structure_type == Identifier::new_static("minecraft", "desert_pyramid")
     }
 
     pub(crate) fn after_place_structure(
@@ -220,7 +270,7 @@ impl StructurePiecePlacer {
         pieces: &mut [StructurePiece],
         clip: BoundingBox,
     ) {
-        if structure.structure_type == Identifier::new_static("minecraft", "desert_pyramid") {
+        if Self::has_after_place(structure) {
             Self::after_place_desert_pyramid(region, pieces, clip);
         }
     }

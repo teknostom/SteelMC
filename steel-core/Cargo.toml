@@ -7,6 +7,8 @@ authors.workspace = true
 build = "build/build.rs"
 
 [features]
+# Per-call-site lock wait/hold timing; see `steel_utils::locks::profiling`.
+lock-profiling = ["steel-utils/lock-profiling"]
 #default = ["stand-alone"]
 stand-alone = []
 slow_chunk_gen = []

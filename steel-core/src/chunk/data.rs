@@ -5,7 +5,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 use rustc_hash::FxHashMap;
 use steel_registry::{
     REGISTRY,
@@ -13,6 +12,7 @@ use steel_registry::{
     fluid::FluidRef,
     vanilla_blocks,
 };
+use steel_utils::locks::{SyncRwLockReadGuard, SyncRwLockWriteGuard};
 use steel_utils::{
     BlockPos, BlockStateId, ChunkPos, Downcast as _, DowncastType, ErasedType, SectionPos,
     locks::{SyncMutex, SyncRwLock},
@@ -379,7 +379,8 @@ impl Chunk {
     }
 
     /// Returns the generation heightmaps retained by this chunk.
-    pub(crate) fn generation_heightmaps(&self) -> RwLockReadGuard<'_, ChunkHeightmaps> {
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
+    pub(crate) fn generation_heightmaps(&self) -> SyncRwLockReadGuard<'_, ChunkHeightmaps> {
         self.heightmaps.read()
     }
 
@@ -403,7 +404,8 @@ impl Chunk {
     }
 
     /// Returns a read guard for the skylight-source cache.
-    pub fn sky_light_sources(&self) -> RwLockReadGuard<'_, ChunkSkyLightSources> {
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
+    pub fn sky_light_sources(&self) -> SyncRwLockReadGuard<'_, ChunkSkyLightSources> {
         self.sky_light_sources.read()
     }
 
@@ -414,32 +416,38 @@ impl Chunk {
     }
 
     /// Returns committed chunk light data.
-    pub fn light(&self) -> RwLockReadGuard<'_, ChunkLightData> {
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
+    pub fn light(&self) -> SyncRwLockReadGuard<'_, ChunkLightData> {
         self.light.read()
     }
 
     /// Returns mutable committed chunk light data.
-    pub(crate) fn light_mut(&self) -> RwLockWriteGuard<'_, ChunkLightData> {
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
+    pub(crate) fn light_mut(&self) -> SyncRwLockWriteGuard<'_, ChunkLightData> {
         self.light.write()
     }
 
     /// Returns structure starts originating in this chunk.
-    pub fn structure_starts(&self) -> RwLockReadGuard<'_, StructureStartMap> {
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
+    pub fn structure_starts(&self) -> SyncRwLockReadGuard<'_, StructureStartMap> {
         self.structure_starts.read()
     }
 
     /// Returns mutable structure starts originating in this chunk.
-    pub fn structure_starts_mut(&self) -> RwLockWriteGuard<'_, StructureStartMap> {
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
+    pub fn structure_starts_mut(&self) -> SyncRwLockWriteGuard<'_, StructureStartMap> {
         self.structure_starts.write()
     }
 
     /// Returns references to nearby structures.
-    pub fn structure_references(&self) -> RwLockReadGuard<'_, StructureReferenceMap> {
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
+    pub fn structure_references(&self) -> SyncRwLockReadGuard<'_, StructureReferenceMap> {
         self.structure_references.read()
     }
 
     /// Returns mutable references to nearby structures.
-    pub fn structure_references_mut(&self) -> RwLockWriteGuard<'_, StructureReferenceMap> {
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
+    pub fn structure_references_mut(&self) -> SyncRwLockWriteGuard<'_, StructureReferenceMap> {
         self.structure_references.write()
     }
 

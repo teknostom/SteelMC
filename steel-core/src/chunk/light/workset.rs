@@ -1,15 +1,16 @@
-use std::{mem, sync::Arc};
+use std::{mem, ops::Deref, sync::Arc};
 
-use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 use steel_registry::{REGISTRY, vanilla_blocks};
+use steel_utils::locks::{SyncRwLockReadGuard, SyncRwLockWriteGuard};
 use steel_utils::{BlockStateId, ChunkPos, SectionPos};
 
 use crate::chunk::{Chunk, chunk_holder::ChunkHolder, section::ChunkSection, status::ChunkStatus};
 
 use super::{
     CachedLightBlock, CachedLightChunk, ChunkLightData, ChunkLightLayerStorage,
-    LightCacheChunkScope, LightCacheLayout, LightCacheSetupRadius, LightChunkSlotArray, LightLayer,
-    LightSection, LightSectionData, LightSectionSlotArray, LightUpdateNotificationCache,
+    LightCacheChunkScope, LightCacheLayout, LightCacheSetupRadius, LightChunkSlotArray,
+    LightEmptinessSnapshot, LightLayer, LightSection, LightSectionData, LightSectionSlotArray,
+    LightUpdateNotificationCache,
 };
 
 /// Error returned when a scoped light workset cannot acquire required chunks.
@@ -256,20 +257,34 @@ impl LightChunkReadCache<'_> {
         f: impl FnOnce(LightLayerEdit<'_>) -> R,
     ) -> R {
         let mut chunks = LightChunkSlotArray::new();
-
-        for chunk_slot in 0..self.light_chunks.slot_count() {
-            let Some(chunk_guard) = self.light_chunks.get_slot(chunk_slot) else {
-                continue;
-            };
-            chunks.insert_slot(chunk_slot, chunk_guard.light_mut());
-        }
-
+        let mut emptiness = LightChunkSlotArray::new();
         let mut edits = Vec::new();
-        let sections = LightLayerEdit::build_section_edits(self.layout, layer, &chunks, &mut edits);
+        let sections = {
+            // Copy-in only: the chunk light locks are released before `f` runs.
+            let mut light_guards = LightChunkSlotArray::new();
+            for chunk_slot in 0..self.light_chunks.slot_count() {
+                let Some(&chunk) = self.light_chunks.get_slot(chunk_slot) else {
+                    continue;
+                };
+                let light = chunk.light();
+                let original = LightLayerEdit::layer_storage(&light, layer).emptiness_snapshot();
+                emptiness.insert_slot(
+                    chunk_slot,
+                    LightEmptinessEdit {
+                        edited: original.map().map(Box::from),
+                        original,
+                    },
+                );
+                light_guards.insert_slot(chunk_slot, light);
+                chunks.insert_slot(chunk_slot, chunk);
+            }
+            LightLayerEdit::build_section_edits(self.layout, layer, &light_guards, &mut edits)
+        };
         let edit = LightLayerEdit {
             layout: self.layout,
             layer,
             chunks,
+            emptiness,
             sections,
             removed_missing_sections: LightSectionSlotArray::new(self.layout),
             edits,
@@ -281,7 +296,7 @@ impl LightChunkReadCache<'_> {
 /// Flat cached chunk-section reads for block-state access during lighting.
 pub struct LightSectionReadCache<'a> {
     layout: LightCacheLayout,
-    sections: LightSectionSlotArray<RwLockReadGuard<'a, ChunkSection>>,
+    sections: LightSectionSlotArray<SyncRwLockReadGuard<'a, ChunkSection>>,
     emptiness_maps: LightChunkSlotArray<Box<[bool]>>,
 }
 
@@ -374,11 +389,23 @@ enum LightSectionEditEntry {
     },
 }
 
+/// One chunk column's emptiness map, edited without holding the chunk light lock.
+struct LightEmptinessEdit {
+    original: LightEmptinessSnapshot,
+    edited: Option<Box<[bool]>>,
+}
+
 /// Scoped mutable light edits for one layer and one workset.
+///
+/// Light sections and emptiness maps are copied in at creation and written
+/// back by [`Self::commit`], so the chunk light locks are held only for the
+/// copy and the write-back. Overlapping light edits are excluded by the light
+/// work gate; other writers only touch emptiness, which commit merges.
 pub struct LightLayerEdit<'a> {
     layout: LightCacheLayout,
     layer: LightLayer,
-    chunks: LightChunkSlotArray<RwLockWriteGuard<'a, ChunkLightData>>,
+    chunks: LightChunkSlotArray<&'a Chunk>,
+    emptiness: LightChunkSlotArray<LightEmptinessEdit>,
     sections: LightSectionSlotArray<LightSectionEditEntry>,
     removed_missing_sections: LightSectionSlotArray<StoredLightSectionEdit>,
     edits: Vec<LightSectionEdit>,
@@ -454,9 +481,10 @@ impl LightLayerEdit<'_> {
     pub fn section_empty(&self, section_pos: SectionPos) -> Option<bool> {
         let chunk_pos = ChunkPos::new(section_pos.x(), section_pos.z());
         let cached_chunk = self.layout.cached_chunk(chunk_pos)?;
-        let light_data = self.chunks.get_slot(cached_chunk.chunk_slot)?;
+        let index = self.layout.range().chunk_section_index(section_pos.y())?;
+        let emptiness = self.emptiness.get_slot(cached_chunk.chunk_slot)?;
 
-        Self::layer_storage(light_data, self.layer).section_empty(section_pos.y())
+        emptiness.edited.as_deref()?.get(index).copied()
     }
 
     /// Updates the cached light layer's real-section emptiness map.
@@ -465,10 +493,11 @@ impl LightLayerEdit<'_> {
     pub fn set_section_empty(&mut self, section_pos: SectionPos, empty: bool) -> Option<bool> {
         let chunk_pos = ChunkPos::new(section_pos.x(), section_pos.z());
         let cached_chunk = self.layout.cached_chunk(chunk_pos)?;
-        let layer = self.layer;
-        let light_data = self.chunks.get_mut_slot(cached_chunk.chunk_slot)?;
+        let index = self.layout.range().chunk_section_index(section_pos.y())?;
+        let emptiness = self.emptiness.get_mut_slot(cached_chunk.chunk_slot)?;
+        let entry = emptiness.edited.as_deref_mut()?.get_mut(index)?;
 
-        Self::layer_storage_mut(light_data, layer).set_section_empty(section_pos.y(), empty)
+        Some(mem::replace(entry, empty))
     }
 
     /// Marks a cached light section non-missing without allocating packed bytes.
@@ -691,6 +720,12 @@ impl LightLayerEdit<'_> {
     ) -> usize {
         debug_assert!(notifications.is_none_or(|cache| cache.layout() == self.layout));
         let mut updated = 0;
+        let mut light_guards = LightChunkSlotArray::new();
+        for chunk_slot in 0..self.chunks.slot_count() {
+            if let Some(chunk) = self.chunks.get_slot(chunk_slot) {
+                light_guards.insert_slot(chunk_slot, chunk.light_mut());
+            }
+        }
 
         for section_slot in 0..self.sections.slot_count() {
             let marked =
@@ -701,7 +736,7 @@ impl LightLayerEdit<'_> {
 
             let changed = match entry {
                 LightSectionEditEntry::Stored { target, edit_index } => {
-                    self.commit_stored_section(target, edit_index)
+                    self.commit_stored_section(&mut light_guards, target, edit_index)
                 }
                 LightSectionEditEntry::Transient { edit_index } => self
                     .edits
@@ -717,13 +752,28 @@ impl LightLayerEdit<'_> {
             }
         }
 
+        let layer = self.layer;
+        for chunk_slot in 0..self.emptiness.slot_count() {
+            let (Some(emptiness), Some(light_data)) = (
+                self.emptiness.get_slot(chunk_slot),
+                light_guards.get_mut_slot(chunk_slot),
+            ) else {
+                continue;
+            };
+            let Some(edited) = emptiness.edited.as_deref() else {
+                continue;
+            };
+            Self::layer_storage_mut(light_data, layer)
+                .merge_emptiness_edit(&emptiness.original, edited);
+        }
+
         updated
     }
 
     fn build_section_edits(
         layout: LightCacheLayout,
         layer: LightLayer,
-        chunks: &LightChunkSlotArray<RwLockWriteGuard<'_, ChunkLightData>>,
+        chunks: &LightChunkSlotArray<impl Deref<Target = ChunkLightData>>,
         edits: &mut Vec<LightSectionEdit>,
     ) -> LightSectionSlotArray<LightSectionEditEntry> {
         let mut sections = LightSectionSlotArray::new(layout);
@@ -772,13 +822,18 @@ impl LightLayerEdit<'_> {
         sections
     }
 
-    fn commit_stored_section(&mut self, target: StoredLightSectionEdit, edit_index: usize) -> bool {
+    fn commit_stored_section(
+        &mut self,
+        light_guards: &mut LightChunkSlotArray<SyncRwLockWriteGuard<'_, ChunkLightData>>,
+        target: StoredLightSectionEdit,
+        edit_index: usize,
+    ) -> bool {
         let Some(edit) = self.edits.get_mut(edit_index) else {
             return false;
         };
         let edited = mem::replace(&mut edit.section, LightSection::missing());
         let layer = self.layer;
-        let Some(light_data) = self.chunks.get_mut_slot(target.chunk_slot) else {
+        let Some(light_data) = light_guards.get_mut_slot(target.chunk_slot) else {
             return false;
         };
         let Some(target_section) = Self::layer_storage_mut(light_data, layer)

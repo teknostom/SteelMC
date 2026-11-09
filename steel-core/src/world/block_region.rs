@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use parking_lot::RwLockReadGuard;
 use smallvec::SmallVec;
 use steel_registry::{REGISTRY, vanilla_blocks};
+use steel_utils::locks::SyncRwLockReadGuard;
 use steel_utils::{BlockPos, BlockStateId, ChunkPos, SectionPos};
 
 use crate::chunk::{
@@ -199,7 +199,7 @@ impl BlockSectionRead<'_> {
 /// Scoped block-state reads over a rectangular set of prelocked sections.
 pub(crate) struct BlockRegionRead<'a> {
     bounds: BlockRegionBounds,
-    sections: SmallVec<[Option<RwLockReadGuard<'a, ChunkSection>>; 8]>,
+    sections: SmallVec<[Option<SyncRwLockReadGuard<'a, ChunkSection>>; 8]>,
     min_chunk_x: i32,
     min_chunk_z: i32,
     chunk_z_count: usize,

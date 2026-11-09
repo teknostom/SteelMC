@@ -27,6 +27,13 @@ impl ChunkMap {
         task
     }
 
+    /// Makes the next refill recompute pending priorities; call after any
+    /// holder load or simulation level change.
+    pub(super) fn mark_generation_priorities_stale(&self) {
+        self.generation_priorities_stale
+            .store(true, Ordering::Release);
+    }
+
     /// Runs queued generation tasks.
     #[instrument(level = "trace", skip(self))]
     pub fn run_generation_tasks_b(&self) {
@@ -38,10 +45,11 @@ impl ChunkMap {
         if pending.is_empty() {
             return;
         }
-
-        pending.retain(|task| !task.is_cancelled());
-        if pending.is_empty() {
-            return;
+        if self
+            .generation_priorities_stale
+            .swap(false, Ordering::AcqRel)
+        {
+            pending.reprioritize();
         }
 
         let running_tasks = self.running_generation_tasks.load(Ordering::Acquire);
@@ -57,19 +65,14 @@ impl ChunkMap {
             return;
         }
 
-        let task_count = pending.len().min(available_slots);
-        if task_count < pending.len() {
-            pending.sort_by_cached_key(|task| Self::generation_task_priority(task));
-        }
-
+        let tasks = pending.pop_runnable(available_slots);
         tracing::trace!(
-            task_count,
+            task_count = tasks.len(),
             pending = pending.len(),
             running_tasks,
             max_running_tasks,
             "Running generation tasks"
         );
-        let tasks = pending.drain(..task_count).collect::<Vec<_>>();
         self.running_generation_tasks
             .fetch_add(tasks.len(), Ordering::AcqRel);
         drop(pending); // Release lock before spawning
@@ -144,6 +147,7 @@ impl ChunkMap {
             chunk_holder.set_simulation_level(self.scheduling.simulation_level(pos));
         }
         if old != Some(level) {
+            self.mark_generation_priorities_stale();
             chunk_holder.update_highest_allowed_status(Some(level));
         }
         if chunk_holder.try_chunk(ChunkStatus::Empty).is_some() {
@@ -168,6 +172,7 @@ impl ChunkMap {
         chunk_holder.cancel_generation_task();
         chunk_holder.clear_load_level();
         chunk_holder.set_simulation_level(None);
+        self.mark_generation_priorities_stale();
         chunk_holder.update_highest_allowed_status(None);
         // Wake any await_chunk futures so generation tasks holding refs to
         // this chunk can detect the status is disallowed and exit.

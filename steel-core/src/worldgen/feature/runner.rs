@@ -6,6 +6,7 @@ use steel_utils::{BoundingBox, ChunkPos};
 
 use super::prelude::*;
 use super::sorter::{FeatureSorter, FeatureStepData};
+use crate::worldgen::region::WorldGenChunkRef;
 use crate::worldgen::structure::piece_placer::StructurePiecePlacer;
 #[cfg(test)]
 use steel_worldgen::structure::StructureReferenceMap;
@@ -304,6 +305,18 @@ impl FeatureDecorationRunner {
                 else {
                     continue;
                 };
+                if Self::try_place_structure_start_shared(
+                    region,
+                    registry,
+                    structure,
+                    source_chunk,
+                    source_pos,
+                    writable_box,
+                    random,
+                    biome_zoom_seed,
+                ) {
+                    continue;
+                }
                 let mut source_starts = source_chunk.structure_starts_mut();
                 let Some(start) = source_starts.get_mut(&structure.key) else {
                     continue;
@@ -337,6 +350,65 @@ impl FeatureDecorationRunner {
                     StructureStart::compute_bounding_box(&start.pieces, start.bb_inflate);
             }
         }
+    }
+
+    /// Places a start's pieces for this chunk under the shared read lock when
+    /// none of them mutates during placement.
+    ///
+    /// Vanilla places pieces without any lock; Steel needs exclusive access only
+    /// for piece state that placement writes. Shared placements of one start
+    /// each write only their own chunk, and their pieces and bounding box stay
+    /// unchanged, so `start.bounding_box` needs no recompute. Returns `false`
+    /// (placing nothing) when the caller must use the exclusive path.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the exclusive placement loop's inputs"
+    )]
+    fn try_place_structure_start_shared(
+        region: &mut WorldGenRegion<'_>,
+        registry: &Registry,
+        structure: StructureRef,
+        source_chunk: WorldGenChunkRef<'_>,
+        source_pos: ChunkPos,
+        writable_box: BoundingBox,
+        random: &mut WorldgenRandom,
+        biome_zoom_seed: i64,
+    ) -> bool {
+        if StructurePiecePlacer::has_after_place(structure) {
+            return false;
+        }
+        let source_starts = source_chunk.structure_starts();
+        let Some(start) = source_starts.get(&structure.key) else {
+            return true;
+        };
+        if start.chunk_pos != source_pos || start.pieces.is_empty() {
+            return true;
+        }
+        let Some(reference_pos) = start.placement_reference_pos() else {
+            return true;
+        };
+        let intersecting = || {
+            start
+                .pieces
+                .iter()
+                .filter(|piece| piece.bounding_box.intersects(writable_box))
+        };
+        if !intersecting().all(StructurePiecePlacer::can_place_piece_shared) {
+            return false;
+        }
+        for piece in intersecting() {
+            let placed = StructurePiecePlacer::try_place_piece_shared(
+                region,
+                registry,
+                piece,
+                reference_pos,
+                writable_box,
+                random,
+                biome_zoom_seed,
+            );
+            debug_assert!(placed.is_some(), "piece was checked as shareable");
+        }
+        true
     }
 
     pub(super) fn set_structure_seed(

@@ -9,11 +9,11 @@ use std::{
     },
 };
 
-use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 use smallvec::SmallVec;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
 use steel_registry::{REGISTRY, RegistryEntry};
 use steel_registry::{vanilla_biomes, vanilla_blocks};
+use steel_utils::locks::{SyncRwLockReadGuard, SyncRwLockWriteGuard};
 use steel_utils::{BlockPos, BlockStateId, ChunkPos, locks::SyncRwLock, serial::WriteTo};
 
 use crate::chunk::paletted_container::{BiomePalette, BlockPalette};
@@ -144,18 +144,21 @@ impl SectionHolder {
 
     /// Acquires a read lock on the section.
     #[inline]
-    pub fn read(&self) -> RwLockReadGuard<'_, ChunkSection> {
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
+    pub fn read(&self) -> SyncRwLockReadGuard<'_, ChunkSection> {
         self.section.read()
     }
 
     /// Attempts to acquire a read lock on the section.
     #[inline]
-    pub fn try_read(&self) -> Option<RwLockReadGuard<'_, ChunkSection>> {
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
+    pub fn try_read(&self) -> Option<SyncRwLockReadGuard<'_, ChunkSection>> {
         self.section.try_read()
     }
 
     /// Acquires a write lock on the section.
     #[inline]
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
     pub fn write(&self) -> SectionWriteGuard<'_> {
         SectionWriteGuard::new(
             self.section.write(),
@@ -166,6 +169,7 @@ impl SectionHolder {
 
     /// Attempts to acquire a write lock on the section.
     #[inline]
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
     pub fn try_write(&self) -> Option<SectionWriteGuard<'_>> {
         self.section.try_write().map(|guard| {
             SectionWriteGuard::new(guard, &self.randomly_ticking_sections, self.section_index)
@@ -175,7 +179,7 @@ impl SectionHolder {
 
 /// A chunk-section write guard that republishes derived lock-free metadata.
 pub struct SectionWriteGuard<'a> {
-    guard: RwLockWriteGuard<'a, ChunkSection>,
+    guard: SyncRwLockWriteGuard<'a, ChunkSection>,
     randomly_ticking_sections: &'a RandomTickSectionBits,
     section_index: usize,
     was_randomly_ticking: bool,
@@ -183,7 +187,7 @@ pub struct SectionWriteGuard<'a> {
 
 impl<'a> SectionWriteGuard<'a> {
     fn new(
-        guard: RwLockWriteGuard<'a, ChunkSection>,
+        guard: SyncRwLockWriteGuard<'a, ChunkSection>,
         randomly_ticking_sections: &'a RandomTickSectionBits,
         section_index: usize,
     ) -> Self {
@@ -1032,6 +1036,17 @@ impl ChunkSection {
         }
     }
 
+    /// Whether cached counters or stable-air occupancy may disagree with the palette.
+    ///
+    /// Tracked setters keep both exact. They go stale only through worldgen
+    /// Building mode, or through construction/arbitrary mutable access, which
+    /// leave the occupancy `Unknown`.
+    #[must_use]
+    pub(crate) const fn needs_recount(&self) -> bool {
+        matches!(&self.states, BlockPalette::Building(_))
+            || matches!(self.stable_air_occupancy, StableAirOccupancy::Unknown)
+    }
+
     pub(crate) fn finalize_generation_counts_if_needed(&mut self) {
         if matches!(&self.states, BlockPalette::Building(_)) {
             self.recalculate_counts();
@@ -1216,6 +1231,41 @@ mod tests {
         assert!(!entire_section_is_stable_air(&holder.read()));
         holder.write().recalculate_counts();
         assert!(entire_section_is_stable_air(&holder.read()));
+    }
+
+    /// Full promotion skips the recount when `needs_recount` is false, so tracked
+    /// writes must leave counters equal to a fresh recount.
+    #[test]
+    fn needs_recount_only_after_untracked_writes() {
+        init_test_behaviors();
+        let counts = |section: &ChunkSection| {
+            (
+                section.non_empty_block_count(),
+                section.fluid_count(),
+                section.ticking_block_count(),
+                section.ticking_fluid_count(),
+            )
+        };
+
+        let mut section = ChunkSection::new_empty();
+        section.set_block_state(1, 2, 3, vanilla_blocks::LAVA.default_state());
+        section.set_block_state(4, 5, 6, vanilla_blocks::WATER.default_state());
+        section.set_block_state(1, 2, 3, vanilla_blocks::STONE.default_state());
+        assert!(!section.needs_recount());
+        let tracked = counts(&section);
+        section.recalculate_counts();
+        assert_eq!(tracked, counts(&section));
+
+        section.set_block_state_for_generation(7, 8, 9, vanilla_blocks::LAVA.default_state());
+        assert!(section.needs_recount());
+        section.recalculate_counts();
+        assert!(!section.needs_recount());
+
+        let loaded = ChunkSection::new_with_biomes(
+            BlockPalette::Homogeneous(vanilla_blocks::STONE.default_state()),
+            plains_biomes(),
+        );
+        assert!(loaded.needs_recount());
     }
 
     #[test]

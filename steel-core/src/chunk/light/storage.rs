@@ -174,6 +174,24 @@ pub struct ChunkLightLayerStorage {
     chunk_section_count: usize,
     sections: Box<[LightSection]>,
     emptiness_map: Option<Box<[bool]>>,
+    /// Per-entry emptiness write counters, so a detached light edit can tell
+    /// which entries were written after it copied the map.
+    emptiness_writes: Box<[u32]>,
+}
+
+/// Emptiness map copied out for a light edit that runs without the chunk light lock.
+#[derive(Debug)]
+pub(crate) struct LightEmptinessSnapshot {
+    map: Option<Box<[bool]>>,
+    writes: Box<[u32]>,
+}
+
+impl LightEmptinessSnapshot {
+    /// Returns the copied emptiness map, if it was known.
+    #[must_use]
+    pub(crate) fn map(&self) -> Option<&[bool]> {
+        self.map.as_deref()
+    }
 }
 
 impl ChunkLightLayerStorage {
@@ -189,6 +207,7 @@ impl ChunkLightLayerStorage {
             chunk_section_count,
             sections,
             emptiness_map: None,
+            emptiness_writes: vec![0; chunk_section_count].into(),
         }
     }
 
@@ -278,6 +297,9 @@ impl ChunkLightLayerStorage {
         }
 
         self.emptiness_map = Some(emptiness_map);
+        for writes in &mut self.emptiness_writes {
+            *writes = writes.wrapping_add(1);
+        }
         Ok(())
     }
 
@@ -295,7 +317,43 @@ impl ChunkLightLayerStorage {
         let emptiness_map = self.emptiness_map.as_deref_mut()?;
         let previous = *emptiness_map.get(index)?;
         emptiness_map[index] = empty;
+        self.emptiness_writes[index] = self.emptiness_writes[index].wrapping_add(1);
         Some(previous)
+    }
+
+    /// Copies the emptiness map and its write counters.
+    #[must_use]
+    pub(crate) fn emptiness_snapshot(&self) -> LightEmptinessSnapshot {
+        LightEmptinessSnapshot {
+            map: self.emptiness_map.clone(),
+            writes: self.emptiness_writes.clone(),
+        }
+    }
+
+    /// Applies emptiness changes from a detached edit.
+    ///
+    /// An entry the edit changed is written only if nobody wrote it since
+    /// `original` was taken. Otherwise the other write is newer and wins, as it
+    /// would have if it had waited for the edit to finish.
+    pub(crate) fn merge_emptiness_edit(
+        &mut self,
+        original: &LightEmptinessSnapshot,
+        edited: &[bool],
+    ) {
+        let (Some(original_map), Some(live_map)) =
+            (original.map.as_deref(), self.emptiness_map.as_deref_mut())
+        else {
+            return;
+        };
+        for (index, &empty) in edited.iter().enumerate() {
+            if original_map.get(index) == Some(&empty)
+                || self.emptiness_writes.get(index) != original.writes.get(index)
+            {
+                continue;
+            }
+            live_map[index] = empty;
+            self.emptiness_writes[index] = self.emptiness_writes[index].wrapping_add(1);
+        }
     }
 
     /// Applies `ScalableLux`'s loaded-sky-data normalization.
@@ -451,6 +509,29 @@ impl ChunkLightData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A detached light edit must not overwrite emptiness written after its
+    /// copy, even when that write restored the original value.
+    #[test]
+    fn emptiness_merge_keeps_entries_written_after_the_snapshot() {
+        let Ok(range) = LightSectionRange::from_world_height(0, 48) else {
+            panic!("valid test height should create a light section range");
+        };
+        let mut storage =
+            ChunkLightLayerStorage::new(LightLayer::Block, range, range.chunk_section_count());
+        let Ok(()) = storage.set_emptiness_map(vec![true; 3].into()) else {
+            panic!("map length matches the chunk section count");
+        };
+        let original = storage.emptiness_snapshot();
+
+        // Another writer toggles section 1 and back while the edit runs.
+        storage.set_section_empty(1, false);
+        storage.set_section_empty(1, true);
+
+        storage.merge_emptiness_edit(&original, &[false, false, true]);
+
+        assert_eq!(storage.emptiness_map(), Some(&[false, true, true][..]));
+    }
 
     #[test]
     fn sky_light_below_range_starts_search_at_min_light_section() {

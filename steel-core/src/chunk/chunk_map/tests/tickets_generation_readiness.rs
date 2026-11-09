@@ -138,7 +138,7 @@ fn cancelled_generation_task_keeps_cached_holders_pinned_for_in_flight_steps() {
     let in_flight_cache = {
         let pending = world.chunk_map.pending_generation_tasks.lock();
         assert_eq!(pending.len(), 1);
-        Arc::clone(&pending[0].cache)
+        Arc::clone(&pending.first().expect("one task is pending").cache)
     };
     assert!(
         cached_holders
@@ -524,4 +524,49 @@ fn full_load_activation_uses_packed_chunk_position_order() {
         world.block_entity_tickers().active_positions(),
         [first_sign, second_sign]
     );
+}
+
+/// Refill dispatch order is (priority from current ticket levels, queue order),
+/// so a level change must reorder tasks that are already queued.
+#[test]
+fn pending_generation_tasks_follow_current_ticket_levels() {
+    let chunk_map = test_chunk_map();
+    let near = ChunkTicketLevel::FULL_CHUNK;
+    let far = ChunkTicketLevel::new(near.raw() + 2).expect("a weaker full-chunk level exists");
+    let [a, b, c] = [
+        ChunkPos::new(0, 0),
+        ChunkPos::new(40, 0),
+        ChunkPos::new(80, 0),
+    ];
+    let order = |tasks: Vec<Arc<ChunkGenerationTask>>| {
+        tasks
+            .iter()
+            .map(|task| task.center_holder().get_pos())
+            .collect::<Vec<_>>()
+    };
+    let schedule_all = || {
+        for pos in [a, b, c] {
+            chunk_map.schedule_generation_task_b(ChunkStatus::StructureStarts, pos);
+        }
+    };
+    let pop_like_refill = || {
+        let mut pending = chunk_map.pending_generation_tasks.lock();
+        if chunk_map
+            .generation_priorities_stale
+            .swap(false, Ordering::AcqRel)
+        {
+            pending.reprioritize();
+        }
+        pending.pop_runnable(3)
+    };
+
+    for (pos, level) in [(a, far), (b, near), (c, far)] {
+        chunk_map.update_chunk_level(pos, Some(level));
+    }
+    schedule_all();
+    assert_eq!(order(pop_like_refill()), [b, a, c]);
+
+    schedule_all();
+    chunk_map.update_chunk_level(c, Some(near));
+    assert_eq!(order(pop_like_refill()), [b, c, a]);
 }

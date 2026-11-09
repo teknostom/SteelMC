@@ -89,6 +89,8 @@ workspace = true
 
 [features]
 fmt = ["dep:prettyplease", "dep:syn"]
+# Per-call-site lock wait/hold timing; see `locks::profiling`.
+lock-profiling = []
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { workspace = true, features = ["fs"] }

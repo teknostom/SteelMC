@@ -5,7 +5,6 @@ use crate::entity::{Entity, EntityBase, EntityBaseLoad, EntitySyncedData};
 use crate::player::Player;
 use crate::world::World;
 use glam::DVec3;
-use parking_lot::MutexGuard;
 use simdnbt::owned::{NbtCompound, NbtTag};
 use simdnbt::{FromNbtTag, ToNbtTag};
 use std::sync::Arc;
@@ -16,6 +15,7 @@ use steel_registry::entity_data::EntityPose;
 use steel_registry::entity_type::{EntityDimensions, EntityTypeRef};
 use steel_registry::vanilla_entity_data::InteractionEntityData;
 use steel_utils::locks::SyncMutex;
+use steel_utils::locks::SyncMutexGuard;
 use steel_utils::nbt::NbtNumeric as _;
 use steel_utils::nbt::NbtValueInput as _;
 use steel_utils::types::InteractionHand;
@@ -318,7 +318,7 @@ impl ToNbtTag for &PlayerAction {
 /// Provides an exclusive view of the synchronized entity data of an interaction entity.
 /// This includes its `width`, its `height`, and the `response` boolean.
 pub struct InteractionEntityDataView<'a> {
-    guard: MutexGuard<'a, InteractionEntityData>,
+    guard: SyncMutexGuard<'a, InteractionEntityData>,
     dimensions_changed: bool,
 }
 

@@ -75,10 +75,12 @@ use crate::world::World;
 use crate::world::tick_scheduler::{BlockTick, FluidTick, ScheduledTickRunBatch};
 use crate::worldgen::{ChunkGeneratorType, WorldGenContext};
 use crate::{entity::Entity, player::Player};
+pub use pending_generation::PendingGenerationTasks;
 
 mod generation_readiness;
 mod light_update_state;
 mod light_updates;
+mod pending_generation;
 mod persistence;
 mod player_tracking;
 mod scheduled_ticks;
@@ -222,7 +224,10 @@ pub struct ChunkMap {
     /// Map of chunks currently being unloaded.
     pub(crate) unloading_chunks: scc::HashMap<ChunkPos, Arc<ChunkHolder>, FxBuildHasher>,
     /// Queue of pending generation tasks.
-    pub pending_generation_tasks: SyncMutex<Vec<Arc<ChunkGenerationTask>>>,
+    pub pending_generation_tasks: SyncMutex<PendingGenerationTasks>,
+    /// Set when any holder's ticket level changes, so the next refill
+    /// recomputes pending generation priorities.
+    generation_priorities_stale: AtomicBool,
     /// Tracker for generation, save, and unload tasks.
     pub task_tracker: TaskTracker,
     /// Authoritative ticket storage and loading/simulation propagation.
@@ -375,7 +380,8 @@ impl ChunkMap {
         Self {
             chunks: scc::HashMap::default(),
             unloading_chunks: scc::HashMap::default(),
-            pending_generation_tasks: SyncMutex::new(Vec::new()),
+            pending_generation_tasks: SyncMutex::new(PendingGenerationTasks::new()),
+            generation_priorities_stale: AtomicBool::new(false),
             task_tracker: TaskTracker::new(),
             scheduling: ChunkSchedulingCoordinator::new(
                 ticket_storage,
@@ -445,7 +451,7 @@ impl ChunkMap {
         self.generation_refill_cancel_token.cancel();
         self.generation_refill_notify.notify_waiters();
 
-        let pending = mem::take(&mut *self.pending_generation_tasks.lock());
+        let pending = self.pending_generation_tasks.lock().take_all();
         for task in pending {
             task.cancel();
             task.center_holder().clear_generation_task_if_current(&task);
@@ -1011,6 +1017,7 @@ impl ChunkMap {
             let readiness = holder.ticking_readiness_snapshot().readiness();
             let previous_visibility = holder.entity_visibility();
             holder.set_simulation_level(change.new_level);
+            self.mark_generation_priorities_stale();
             let previous_membership = Self::ticking_snapshot_membership(readiness, previous_level);
             let current_membership = Self::ticking_snapshot_membership(readiness, change.new_level);
             snapshot_changed |= previous_membership != current_membership;

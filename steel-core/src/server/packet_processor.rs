@@ -16,8 +16,8 @@ use crate::{
         connection::{ScheduledPacketExecution, ScheduledPlayPacket},
     },
 };
-use parking_lot::Condvar;
 use rustc_hash::{FxHashMap, FxHashSet};
+use steel_utils::locks::SyncCondvar;
 use steel_utils::{locks::SyncMutex, translations};
 use tokio::sync::Notify;
 use tokio::task::yield_now;
@@ -276,7 +276,7 @@ struct PacketQueueState<K, T> {
 struct PacketQueue<K, T> {
     state: SyncMutex<PacketQueueState<K, T>>,
     limits: PacketAdmissionLimits,
-    work_available: Condvar,
+    work_available: SyncCondvar,
     idle: Notify,
     progress: Notify,
 }
@@ -313,7 +313,7 @@ where
                 completed: 0,
             }),
             limits,
-            work_available: Condvar::new(),
+            work_available: SyncCondvar::new(),
             idle: Notify::new(),
             progress: Notify::new(),
         }

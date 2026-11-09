@@ -57,6 +57,8 @@ workspace = true
 serde_json.workspace = true
 
 [features]
+# Per-call-site lock wait/hold timing; see `steel_utils::locks::profiling`.
+lock-profiling = ["steel-core/lock-profiling"]
 default = ["mimalloc"]
 stand-alone = []
 deadlock_detection = ["dep:parking_lot"]

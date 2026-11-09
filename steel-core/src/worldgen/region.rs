@@ -10,7 +10,6 @@ use std::{
     time::Instant,
 };
 
-use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 use simdnbt::owned::NbtCompound;
 use small_map::FxSmallMap;
 use smallvec::SmallVec;
@@ -19,6 +18,7 @@ use steel_registry::{
     blocks::block_state_ext::BlockStateExt as _, blocks::properties::Direction,
     blocks::shapes::SupportType, fluid::FluidRef, vanilla_blocks,
 };
+use steel_utils::locks::{SyncRwLockReadGuard, SyncRwLockWriteGuard};
 use steel_utils::random::RandomSource;
 use steel_utils::{
     BlockPos, BlockStateId, ChunkPos, PackedChunkPos, PackedSectionBlockPos, SectionPos,
@@ -116,11 +116,18 @@ impl WorldGenChunkRef<'_> {
         self.chunk.sections()
     }
 
-    pub(crate) fn structure_starts_mut(&self) -> RwLockWriteGuard<'_, StructureStartMap> {
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
+    pub(crate) fn structure_starts(&self) -> SyncRwLockReadGuard<'_, StructureStartMap> {
+        self.chunk.structure_starts()
+    }
+
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
+    pub(crate) fn structure_starts_mut(&self) -> SyncRwLockWriteGuard<'_, StructureStartMap> {
         self.chunk.structure_starts_mut()
     }
 
-    pub(crate) fn structure_references(&self) -> RwLockReadGuard<'_, StructureReferenceMap> {
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
+    pub(crate) fn structure_references(&self) -> SyncRwLockReadGuard<'_, StructureReferenceMap> {
         self.chunk.structure_references()
     }
 
@@ -1327,6 +1334,7 @@ impl<'region, 'world, 'profile> WorldGenBulkSectionAccess<'region, 'world, 'prof
         section.set_block_state(local_x, local_y, local_z, state)
     }
 
+    #[cfg_attr(feature = "lock-profiling", track_caller)]
     fn ore_section_write_guard<'section>(
         ore_profile: Option<&RefCell<OreFeatureStats>>,
         section: &'section SectionHolder,

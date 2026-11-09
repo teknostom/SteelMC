@@ -25,6 +25,7 @@ use std::sync::atomic::Ordering;
 const PREGEN_SIZE_ENV: &str = "PREGEN_SIZE";
 const WORLD_IDENTIFIER_ENV: &str = "WORLD_IDENTIFIER";
 const PREGEN_WINDOW_SIZE_ENV: &str = "PREGEN_WINDOW_SIZE";
+const PREGEN_WHOLE_AREA_ENV: &str = "PREGEN_WHOLE_AREA";
 const VANILLA_PLAYER_SPAWN_SIZE_CHUNKS: i32 = 7;
 const DEFAULT_PREGEN_WINDOW_SIZE: i32 = 32;
 const PREGEN_ACTIVE_WINDOWS: usize = 2;
@@ -176,6 +177,9 @@ impl Server {
     /// Set `WORLD_IDENTIFIER` to pregenerate a specific world instead of the server default world.
     /// Set `PREGEN_WINDOW_SIZE` to override the default 32-chunk window side length.
     /// The configured size must fit the active-window unload-backpressure budget.
+    /// Set `PREGEN_WHOLE_AREA=1` to request the whole area in one sweep instead of
+    /// windows. It bypasses that budget, so every chunk stays loaded until the end.
+    /// It cannot be combined with `PREGEN_WINDOW_SIZE`.
     pub async fn prepare_spawn_area(&self) -> bool {
         let overworld = match get_world_identifier() {
             Ok(None) => self.overworld(),
@@ -202,7 +206,7 @@ impl Server {
                 return false;
             }
         };
-        let window_size = match get_pregen_window_size() {
+        let window_size = match get_pregen_window_size(pregen_size) {
             Ok(window_size) => window_size,
             Err(error) => {
                 log::error!("{error}");
@@ -257,13 +261,38 @@ fn get_world_identifier() -> Result<Option<Identifier>, String> {
     }
 }
 
-fn get_pregen_window_size() -> Result<i32, String> {
+/// Returns the window side length; the whole area is one window when requested.
+fn get_pregen_window_size(pregen_size: PregenSize) -> Result<i32, String> {
+    let whole_area = match env::var(PREGEN_WHOLE_AREA_ENV) {
+        Ok(value) => parse_pregen_whole_area(&value)?,
+        Err(env::VarError::NotPresent) => false,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(format!("{PREGEN_WHOLE_AREA_ENV} must be valid unicode"));
+        }
+    };
+    if whole_area {
+        if env::var_os(PREGEN_WINDOW_SIZE_ENV).is_some() {
+            return Err(format!(
+                "{PREGEN_WHOLE_AREA_ENV} and {PREGEN_WINDOW_SIZE_ENV} cannot both be set"
+            ));
+        }
+        return Ok(pregen_size.side_length);
+    }
+
     match env::var(PREGEN_WINDOW_SIZE_ENV) {
         Ok(value) => parse_pregen_window_size(&value),
         Err(env::VarError::NotPresent) => Ok(DEFAULT_PREGEN_WINDOW_SIZE),
         Err(env::VarError::NotUnicode(_)) => {
             Err(format!("{PREGEN_WINDOW_SIZE_ENV} must be valid unicode"))
         }
+    }
+}
+
+fn parse_pregen_whole_area(value: &str) -> Result<bool, String> {
+    match value {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(format!("{PREGEN_WHOLE_AREA_ENV} must be 1/true or 0/false")),
     }
 }
 
@@ -412,7 +441,8 @@ async fn generate_pregen(
     let start = Instant::now();
 
     log::info!(
-        "Pregeneration windowing: {window_size}x{window_size} target chunks, {PREGEN_ACTIVE_WINDOWS} active windows, dependency halo {FULL_DEPENDENCY_RADIUS} chunks",
+        "Pregeneration windowing: {} windows of up to {window_size}x{window_size} target chunks, up to {PREGEN_ACTIVE_WINDOWS} active, dependency halo {FULL_DEPENDENCY_RADIUS} chunks",
+        pending_windows.len(),
     );
 
     fill_active_windows(world, &mut pending_windows, &mut active_windows);
@@ -648,6 +678,18 @@ mod tests {
         assert!(parse_pregen_window_size("0").is_err());
         assert!(parse_pregen_window_size("-1").is_err());
         assert!(parse_pregen_window_size("wide").is_err());
+    }
+
+    #[test]
+    fn whole_area_window_covers_the_area_in_one_sweep() {
+        let size = PregenSize::from_side_length(257)
+            .ok()
+            .flatten()
+            .expect("257 is a valid pregen size");
+        let windows = build_pregen_windows(ChunkPos::new(0, 0), size.radius, size.side_length);
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].chunk_count(), total_chunks(size.side_length));
     }
 
     #[test]

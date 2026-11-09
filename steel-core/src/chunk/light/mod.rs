@@ -145,6 +145,7 @@ pub use sky_propagation::{
     propagate_sky_light_chunk_without_edge_checks,
 };
 pub use sky_sources::ChunkSkyLightSources;
+pub(crate) use storage::LightEmptinessSnapshot;
 pub use storage::{
     ChunkLightData, ChunkLightEmptinessMapLengthError, ChunkLightLayerStorage, LightSection,
     LightSectionData,

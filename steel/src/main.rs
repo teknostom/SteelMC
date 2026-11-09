@@ -118,6 +118,9 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 // Windows defaults to a 1 MB main thread stack, which overflows in debug
 // builds due to deeply nested generated density functions.
 fn main() {
+    #[cfg(feature = "lock-profiling")]
+    init_lock_profiling();
+
     #[cfg(all(windows, debug_assertions))]
     {
         thread::Builder::new()
@@ -337,7 +340,10 @@ async fn run_server(
 
     let server = Arc::clone(&steel.server);
 
-    if !server.prepare_spawn_area().await {
+    let spawn_area_ready = server.prepare_spawn_area().await;
+    #[cfg(feature = "lock-profiling")]
+    write_lock_profile("lock_profile_spawn_area.txt", true);
+    if !spawn_area_ready {
         server.save_and_shutdown().await;
         return Ok(());
     }
@@ -354,7 +360,43 @@ async fn run_server(
     task_tracker.wait().await;
 
     server.save_and_shutdown().await;
+    #[cfg(feature = "lock-profiling")]
+    write_lock_profile("lock_profile_runtime.txt", false);
 
     log::info!("Server stopped");
     Ok(())
+}
+
+/// Selects the lock profile mode from `STEEL_LOCK_PROFILE` (`full` or `wait-only`).
+#[cfg(feature = "lock-profiling")]
+fn init_lock_profiling() {
+    use steel_utils::locks::profiling::{self, ProfileMode};
+
+    let mode = match env::var("STEEL_LOCK_PROFILE").as_deref() {
+        Ok("wait-only") => ProfileMode::WaitOnly,
+        Ok("full") | Err(_) => ProfileMode::Full,
+        Ok(other) => {
+            eprintln!("Unknown STEEL_LOCK_PROFILE={other:?}, expected `full` or `wait-only`");
+            ProfileMode::Full
+        }
+    };
+    profiling::set_mode(mode);
+}
+
+/// Writes the lock profile collected since the last reset to `path`.
+#[cfg(feature = "lock-profiling")]
+fn write_lock_profile(path: &str, reset: bool) {
+    use std::fs;
+
+    use steel_utils::locks::profiling;
+
+    const ROWS: usize = 40;
+    let report = profiling::report(ROWS);
+    if reset {
+        profiling::reset();
+    }
+    match fs::write(path, &report) {
+        Ok(()) => log::info!("Lock profile written to {path}"),
+        Err(err) => log::warn!("Failed to write lock profile to {path}: {err}"),
+    }
 }

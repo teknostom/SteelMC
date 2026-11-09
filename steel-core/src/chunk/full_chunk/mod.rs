@@ -289,9 +289,13 @@ impl Chunk {
             }
         }
 
-        // Recalculate section counts for random tick optimization
+        // Vanilla keeps counts incremental and only recounts on load; recount only
+        // sections left stale by worldgen's untracked writes. The read check keeps
+        // up-to-date sections from contending with concurrent light reads.
         for section in &proto_chunk.sections.sections {
-            section.write().recalculate_counts();
+            if section.read().needs_recount() {
+                section.write().recalculate_counts();
+            }
         }
 
         // Vanilla keeps proto ticks pending through Full promotion. Retaining

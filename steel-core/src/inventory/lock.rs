@@ -4,14 +4,13 @@
 //! deterministic order to prevent deadlocks when performing operations that
 //! span multiple inventories (e.g., transferring items between containers).
 
-use parking_lot::ArcMutexGuard;
-use parking_lot::RawMutex;
 use rustc_hash::FxHashMap;
 use std::borrow::Borrow;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use steel_utils::locks::Shared;
+use steel_utils::locks::SyncArcMutexGuard;
 use steel_utils::{Downcast as _, DowncastType, locks::SyncMutex};
 
 use crate::{
@@ -32,7 +31,7 @@ struct ContainerOwner {
 /// Thread-safe reference to an erased container.
 pub type SharedContainer = Shared<dyn Container>;
 
-struct LockedContainer(ArcMutexGuard<RawMutex, dyn Container>);
+struct LockedContainer(SyncArcMutexGuard<dyn Container>);
 
 impl Deref for LockedContainer {
     type Target = dyn Container;
