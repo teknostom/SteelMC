@@ -640,6 +640,7 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
 
         let mut pending_writes: Vec<(usize, BlockStateId)> = Vec::new();
         let mut column_buf: Vec<BlockStateId> = Vec::new();
+        let mut column_class: Vec<SurfaceScanClass> = Vec::new();
         let mut material_ore_vein_results: SmallVec<[Option<BlockStateId>; 2]> = SmallVec::new();
         let condition_noise_values = N::surface_noise_ids()
             .iter()
@@ -651,6 +652,10 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
             .collect::<Vec<_>>();
         let condition_noise_cache =
             SurfaceConditionNoiseCache::new(&condition_noise_values, &condition_noise_initialized);
+
+        // Columns only write themselves after being read, so one copy taken
+        // here answers every column read except those an extension rewrote.
+        let block_snapshot = chunk.snapshot_block_states();
 
         for local_x in 0..16usize {
             for local_z in 0..16usize {
@@ -679,9 +684,9 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                 } else {
                     None
                 };
-                if self.surface_extension_biomes.eroded_badlands
-                    && surface_biome_id == Some(eroded_badlands_id)
-                {
+                let wrote_extension = self.surface_extension_biomes.eroded_badlands
+                    && surface_biome_id == Some(eroded_badlands_id);
+                if wrote_extension {
                     start_height = self.surface_system.eroded_badlands_extension(
                         chunk,
                         local_x,
@@ -693,9 +698,13 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                     );
                 }
 
-                // Snapshot the column once — avoids per-block section locking in the Y scan.
-                // Taken after eroded_badlands_extension which may write blocks above the surface.
-                chunk.read_column_into(local_x, local_z, &mut column_buf);
+                // The eroded badlands extension may have written this column above the surface.
+                if wrote_extension {
+                    chunk.read_column_into(local_x, local_z, &mut column_buf);
+                } else {
+                    block_snapshot.read_column_into(local_x, local_z, &mut column_buf);
+                }
+                SurfaceScanClass::classify_column(&column_buf, &mut column_class);
 
                 // Surface depth for this column
                 let surface_depth = self.surface_system.get_surface_depth(block_x, block_z);
@@ -749,15 +758,15 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
 
                 for y in (min_y..=start_height).rev() {
                     let relative_y = (y - min_y) as usize;
-                    let state = column_buf[relative_y];
+                    let class = column_class[relative_y];
 
-                    if state.is_air() {
+                    if class == SurfaceScanClass::Air {
                         stone_depth_above = 0;
                         water_height = i32::MIN;
                         continue;
                     }
 
-                    if state.get_block().config.liquid {
+                    if class == SurfaceScanClass::Liquid {
                         if water_height == i32::MIN {
                             water_height = y + 1;
                         }
@@ -773,9 +782,8 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                                 break;
                             }
                             let la_rel = (la_y - min_y) as usize;
-                            let la_state = column_buf[la_rel];
                             // isStone = !isAir && !isLiquid
-                            if la_state.is_air() || la_state.get_block().config.liquid {
+                            if column_class[la_rel] != SurfaceScanClass::Solid {
                                 next_ceiling_stone_y = la_y + 1;
                                 break;
                             }
@@ -1183,6 +1191,42 @@ pub(crate) fn fuzzed_biome_at_block<F: FnMut(IVec3) -> u16>(
         },
     );
     quart_biome(b)
+}
+
+/// Surface-scan classification of a block state: vanilla's `isAir` and
+/// `isLiquid` checks, evaluated once per column instead of once per visit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SurfaceScanClass {
+    Air,
+    Liquid,
+    Solid,
+}
+
+impl SurfaceScanClass {
+    fn of(state: BlockStateId) -> Self {
+        if state.is_air() {
+            Self::Air
+        } else if state.get_block().config.liquid {
+            Self::Liquid
+        } else {
+            Self::Solid
+        }
+    }
+
+    /// Classifies a column bottom-up; columns are long runs of one state, so the
+    /// previous state's class is reused.
+    fn classify_column(states: &[BlockStateId], out: &mut Vec<Self>) {
+        out.clear();
+        let mut last: Option<(BlockStateId, Self)> = None;
+        out.extend(states.iter().map(|&state| match last {
+            Some((last_state, class)) if last_state == state => class,
+            _ => {
+                let class = Self::of(state);
+                last = Some((state, class));
+                class
+            }
+        }));
+    }
 }
 
 #[cfg(test)]

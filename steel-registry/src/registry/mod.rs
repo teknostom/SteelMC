@@ -831,6 +831,7 @@ mod tests {
             carvers,
             features,
             id: OnceLock::new(),
+            feature_set: OnceLock::new(),
         }))
     }
 

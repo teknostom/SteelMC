@@ -195,6 +195,19 @@ impl<V: Hash + Eq + Copy + Default + Debug, const DIM: usize> PalettedContainer<
         }
     }
 
+    /// Copies every value into `out` in the y,z,x order of [`Self::get_at_index`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `out` is not exactly [`Self::VOLUME`] long.
+    pub fn copy_values_into(&self, out: &mut [V]) {
+        match self {
+            Self::Homogeneous(value) => out.fill(*value),
+            Self::Heterogeneous(data) => out.copy_from_slice(data.values()),
+            Self::Building(cube) => out.copy_from_slice(cube.as_flattened().as_flattened()),
+        }
+    }
+
     /// Gets the value at a y,z,x linear index.
     ///
     /// The index layout is `x + z * DIM + y * DIM * DIM`, matching the flat

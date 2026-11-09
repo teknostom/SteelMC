@@ -5,6 +5,7 @@ use steel_utils::{BlockPos, BlockStateId, ChunkPos, DowncastType, types::UpdateF
 use crate::chunk::Chunk;
 use crate::chunk::chunk_holder::ChunkHolder;
 use crate::chunk::heightmap::{Heightmap, HeightmapType};
+use crate::chunk::section::SectionsBlockSnapshot;
 use crate::chunk::status::ChunkStatus;
 
 /// Marker for vanilla's atomic Terrain generation operation.
@@ -194,6 +195,12 @@ impl GenerationChunk<'_, TerrainPhase> {
     #[must_use]
     pub fn read_all_biomes(self) -> Box<[u16]> {
         self.chunk.sections().read_all_biomes()
+    }
+
+    /// Copies every section's block states for column-at-a-time passes.
+    #[must_use]
+    pub fn snapshot_block_states(self) -> SectionsBlockSnapshot {
+        self.chunk.sections().snapshot_block_states()
     }
 
     /// Reads one complete block column into `output`.

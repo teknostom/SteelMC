@@ -32,10 +32,6 @@ impl FeatureDecorationRunner {
             );
         };
 
-        biome
-            .features
-            .iter()
-            .flatten()
-            .any(|feature_key| feature_key == target_feature_key)
+        biome.has_feature(target_feature_key)
     }
 }

@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use simdnbt::ToNbtTag;
 use simdnbt::owned::NbtTag;
 use steel_utils::Identifier;
@@ -24,9 +24,20 @@ pub struct Biome {
     pub features: Vec<Vec<Identifier>>,
     /// Cached registry ID, set during registration for O(1) lookup on hot paths.
     pub id: OnceLock<usize>,
+    /// Lazily built union of [`Self::features`], like vanilla's memoized
+    /// `BiomeGenerationSettings.featureSet`.
+    pub feature_set: OnceLock<FxHashSet<Identifier>>,
 }
 
 impl Biome {
+    /// Whether any decoration step of this biome lists the placed feature.
+    #[must_use]
+    pub fn has_feature(&self, feature: &Identifier) -> bool {
+        self.feature_set
+            .get_or_init(|| self.features.iter().flatten().cloned().collect())
+            .contains(feature)
+    }
+
     /// Returns `true` if this biome is tagged with the given tag.
     pub fn has_tag(&'static self, tag: &Identifier) -> bool {
         REGISTRY.biomes.is_in_tag(self, tag)

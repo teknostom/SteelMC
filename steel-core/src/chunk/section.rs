@@ -177,6 +177,31 @@ impl SectionHolder {
     }
 }
 
+/// Block states of every section of a chunk, copied by
+/// [`Sections::snapshot_block_states`].
+pub struct SectionsBlockSnapshot {
+    /// Section-major, then the y,z,x order of `BlockPalette::get_at_index`.
+    states: Box<[BlockStateId]>,
+}
+
+impl SectionsBlockSnapshot {
+    /// Reads one block column bottom-up, like [`Sections::read_column_into`].
+    pub fn read_column_into(&self, x: usize, z: usize, buf: &mut Vec<BlockStateId>) {
+        const DIM: usize = BlockPalette::SIZE;
+        debug_assert!(x < DIM);
+        debug_assert!(z < DIM);
+
+        let total = self.states.len() / (DIM * DIM);
+        if buf.len() != total {
+            buf.resize(total, BlockStateId::default());
+        }
+        let column = self.states[z * DIM + x..].iter().step_by(DIM * DIM);
+        for (slot, &state) in buf.iter_mut().zip(column) {
+            *slot = state;
+        }
+    }
+}
+
 /// A chunk-section write guard that republishes derived lock-free metadata.
 pub struct SectionWriteGuard<'a> {
     guard: SyncRwLockWriteGuard<'a, ChunkSection>,
@@ -511,6 +536,23 @@ impl Sections {
         }
     }
 
+    /// Copies every section's block states, taking each section's read lock once.
+    ///
+    /// For passes that read each column once and only write the column they just
+    /// read, so later column reads from the copy match live reads.
+    #[must_use]
+    pub fn snapshot_block_states(&self) -> SectionsBlockSnapshot {
+        const VOLUME: usize = BlockPalette::VOLUME;
+        let mut states = vec![BlockStateId::default(); self.sections.len() * VOLUME];
+        let (section_states, _) = states.as_chunks_mut::<VOLUME>();
+        for (holder, out) in self.sections.iter().zip(section_states) {
+            holder.read().states.copy_values_into(out);
+        }
+        SectionsBlockSnapshot {
+            states: states.into_boxed_slice(),
+        }
+    }
+
     /// Reads all biome palette values into a flat array.
     ///
     /// Indexed as `[section_idx * 64 + qy * 16 + qz * 4 + qx]`.
@@ -837,17 +879,34 @@ impl ChunkSection {
             return;
         }
 
-        for local_index in 0..BlockPalette::VOLUME {
-            let state = self.states.get_at_index(local_index);
-            if state.get_light_emission() == 0 {
-                continue;
-            }
-
+        let mut push = |local_index: usize| {
             sources.push(BlockPos::new(
                 chunk_min_x + (local_index & 15) as i32,
                 section_min_y + (local_index >> 8) as i32,
                 chunk_min_z + ((local_index >> 4) & 15) as i32,
             ));
+        };
+        if let BlockPalette::Heterogeneous(data) = &self.states {
+            // Every palette entry occurs in the cube, so matching against the
+            // few emitting entries finds the same positions in the same order.
+            let emitting: SmallVec<[BlockStateId; 4]> = data
+                .palette()
+                .iter()
+                .map(|&(state, _)| state)
+                .filter(|state| state.get_light_emission() > 0)
+                .collect();
+            for (local_index, state) in data.values().iter().enumerate() {
+                if emitting.contains(state) {
+                    push(local_index);
+                }
+            }
+            return;
+        }
+
+        for local_index in 0..BlockPalette::VOLUME {
+            if self.states.get_at_index(local_index).get_light_emission() > 0 {
+                push(local_index);
+            }
         }
     }
 

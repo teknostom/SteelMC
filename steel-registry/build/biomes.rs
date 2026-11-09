@@ -575,6 +575,7 @@ pub(crate) fn build() -> TokenStream {
                 carvers: #carvers,
                 features: #features,
                 id: OnceLock::new(),
+                feature_set: OnceLock::new(),
             });
         });
         let biome_ident = Ident::new(&biome_name.to_shouty_snake_case(), Span::call_site());

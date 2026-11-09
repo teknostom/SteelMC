@@ -42,7 +42,8 @@ macro_rules! impl_registry_entry_eq {
     ($Entry:ty) => {
         impl ::core::cmp::PartialEq for $Entry {
             fn eq(&self, other: &Self) -> bool {
-                self.key == other.key
+                // The same entry always has the same key; skip the string compare.
+                ::core::ptr::eq(self, other) || self.key == other.key
             }
         }
 

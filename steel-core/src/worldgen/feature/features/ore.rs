@@ -243,6 +243,19 @@ impl FeatureDecorationRunner {
                 continue;
             }
 
+            // Same per-axis expressions as vanilla's inner loops, evaluated once
+            // per node instead of once per (x, y, z); bit-identical.
+            let axis_distances_squared = |min: i32, max: i32, center: f64| {
+                (min..=max)
+                    .map(|coord| {
+                        let distance = (f64::from(coord) + 0.5 - center) / radius;
+                        distance * distance
+                    })
+                    .collect::<SmallVec<[f64; 32]>>()
+            };
+            let y_distances_squared = axis_distances_squared(y_min, y_max, node[1]);
+            let z_distances_squared = axis_distances_squared(z_min, z_max, node[2]);
+
             for x in x_min..=x_max {
                 let x_offset = i64::from(x) - i64::from(x_start);
                 let x_distance = (f64::from(x) + 0.5 - node[0]) / radius;
@@ -251,18 +264,16 @@ impl FeatureDecorationRunner {
                     continue;
                 }
 
-                for y in y_min..=y_max {
+                for (y, &y_distance_squared) in (y_min..=y_max).zip(&y_distances_squared) {
                     let y_offset = i64::from(y) - i64::from(y_start);
-                    let y_distance = (f64::from(y) + 0.5 - node[1]) / radius;
-                    let x_y_distance_squared = x_distance_squared + y_distance * y_distance;
+                    let x_y_distance_squared = x_distance_squared + y_distance_squared;
                     if x_y_distance_squared >= 1.0 {
                         continue;
                     }
 
-                    for z in z_min..=z_max {
+                    for (z, &z_distance_squared) in (z_min..=z_max).zip(&z_distances_squared) {
                         let z_offset = i64::from(z) - i64::from(z_start);
-                        let z_distance = (f64::from(z) + 0.5 - node[2]) / radius;
-                        if x_y_distance_squared + z_distance * z_distance >= 1.0 {
+                        if x_y_distance_squared + z_distance_squared >= 1.0 {
                             continue;
                         }
 
