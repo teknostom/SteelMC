@@ -43,6 +43,17 @@ pub trait NoiseSettings: Send + Sync {
     fn default_fluid_id() -> BlockStateId;
 }
 
+/// Router entries a [`ColumnCache`] can prepare without evaluating the whole column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnRouter {
+    /// The `erosion` router entry.
+    Erosion,
+    /// The `depth` router entry.
+    Depth,
+    /// The `preliminary_surface_level` router entry.
+    PreliminarySurfaceLevel,
+}
+
 /// Column cache for a dimension's flat-cached density function results.
 ///
 /// Stores Y-independent values that only need to be computed once per (x, z) column.
@@ -54,6 +65,11 @@ pub trait ColumnCache: Clone + Default + Send + Sync {
     ///
     /// If the cache already holds values for this column, this is a no-op.
     fn ensure(&mut self, x: i32, z: i32, noises: &Self::Noises);
+
+    /// Prepares the cache to read `router` at the given column, evaluating only
+    /// the column values it depends on. A later [`Self::ensure`] recomputes the
+    /// rest.
+    fn ensure_router(&mut self, x: i32, z: i32, router: ColumnRouter, noises: &Self::Noises);
 
     /// Pre-compute flat-cached values for all quart positions in a chunk.
     ///
@@ -172,6 +188,10 @@ pub trait DimensionNoises: Sized + Send + Sync {
     /// Whether vein functions have interpolation channels.
     fn vein_interp_enabled() -> bool;
 
+    /// Inclusive range of cell-corner Ys at which an interpolated channel can
+    /// read the blended noise; corners outside it may pass any value.
+    fn blended_noise_corner_y_range() -> (i32, i32);
+
     /// Interpolated channels that, when `<= 0` at a block, prove its combined
     /// final density is not positive. Cell corners alone are insufficient for
     /// Vanilla's repeated-addition interpolation.
@@ -241,6 +261,15 @@ pub trait DimensionNoises: Sized + Send + Sync {
         y: i32,
         z: i32,
     ) -> f32;
+
+    /// [`Self::combine_interpolated`] for `N` Y values of the cache's column.
+    /// `interpolated[lane]` holds that Y's channels.
+    fn combine_interpolated_y_simd<const N: usize, const W: usize>(
+        &self,
+        cache: &mut Self::ColumnCache,
+        interpolated: &[[f32; W]; N],
+        ys: [i32; N],
+    ) -> [f32; N];
 
     /// Combine trilinearly interpolated values for `vein_toggle`.
     fn combine_vein_toggle(
@@ -343,4 +372,150 @@ pub trait DimensionNoises: Sized + Send + Sync {
         z: i32,
         out: &mut [Option<BlockStateId>],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::array;
+
+    use super::{ColumnRouter, DimensionNoises};
+    use crate::density_functions::overworld::OverworldNoises;
+    use crate::noise_parameters::get_noise_parameters;
+    use steel_utils::random::{Random, xoroshiro::Xoroshiro};
+
+    type Cache = <OverworldNoises as DimensionNoises>::ColumnCache;
+
+    /// Every router the overworld reads from a column, as raw bits.
+    fn full_column(noises: &OverworldNoises, cache: &mut Cache, x: i32, z: i32) -> Vec<u32> {
+        let mut values = vec![
+            noises.router_erosion(cache, x, 0, z),
+            noises.router_continentalness(cache, x, 0, z),
+            noises.router_temperature(cache, x, 0, z),
+            noises.router_vegetation(cache, x, 0, z),
+            noises.router_ridges(cache, x, 0, z),
+            noises.router_preliminary_surface_level(cache, x, 0, z),
+        ];
+        for y in [-64, 0, 70, 200] {
+            values.push(noises.router_depth(cache, x, y, z));
+            values.push(noises.router_final_density(cache, x, y, z));
+        }
+        values.into_iter().map(f32::to_bits).collect()
+    }
+
+    /// The SIMD combine must reproduce the scalar one bit for bit, including at
+    /// clamp and range-choice boundaries and signed zeros.
+    #[test]
+    fn combine_interpolated_y_simd_matches_scalar() {
+        const W: usize = 16;
+        let seed = 9;
+        let splitter = Xoroshiro::from_seed(seed).next_positional();
+        let noises = OverworldNoises::create(seed, &splitter, &get_noise_parameters());
+        let mut cache = Cache::default();
+        cache.ensure(12, -40, &noises);
+
+        let specials = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            1.5,
+            -1.5,
+            -1_000_000.0,
+            0.03,
+            64.0,
+            -64.0,
+            1e-30,
+            -1e-30,
+        ];
+        let mut rng = Xoroshiro::from_seed(17);
+        let count = OverworldNoises::interpolated_count();
+        for round in 0..4000 {
+            let rows: [[f32; W]; 8] = array::from_fn(|_| {
+                array::from_fn(|channel| {
+                    if channel >= count {
+                        0.0
+                    } else if rng.next_i32_bounded(3) == 0 {
+                        specials[rng.next_i32_bounded(specials.len() as i32) as usize]
+                    } else {
+                        (rng.next_f32() - 0.5) * 4.0
+                    }
+                })
+            });
+            let ys = array::from_fn(|lane| -64 + 7 * round % 384 + lane as i32);
+            let simd = noises.combine_interpolated_y_simd(&mut cache, &rows, ys);
+            for lane in 0..8 {
+                let scalar =
+                    noises.combine_interpolated(&mut cache, &rows[lane][..count], 0, ys[lane], 0);
+                assert_eq!(
+                    simd[lane].to_bits(),
+                    scalar.to_bits(),
+                    "{:?}",
+                    &rows[lane][..count]
+                );
+            }
+        }
+    }
+
+    /// Partial column evaluation must agree with a full `ensure`, and must not
+    /// leave a later full `ensure` reading values it skipped.
+    #[test]
+    fn ensure_router_matches_full_ensure() {
+        let seed = 5;
+        let splitter = Xoroshiro::from_seed(seed).next_positional();
+        let noises = OverworldNoises::create(seed, &splitter, &get_noise_parameters());
+        let columns = [(0, 0), (37, -211), (-1000, 523), (64, 64), (-3, 4093)];
+
+        for with_grid in [false, true] {
+            for (x, z) in columns {
+                let mut reference = Cache::default();
+                reference.ensure(x, z, &noises);
+                let expected = full_column(&noises, &mut reference, x, z);
+
+                let mut cache = Cache::default();
+                if with_grid {
+                    cache.init_grid(x & !15, z & !15, &noises);
+                }
+                // Leave the cache valid at another column first.
+                cache.ensure(x + 4, z, &noises);
+
+                cache.ensure_router(x, z, ColumnRouter::Erosion, &noises);
+                assert_eq!(
+                    noises.router_erosion(&mut cache, x, 0, z).to_bits(),
+                    expected[0]
+                );
+                cache.ensure_router(x, z, ColumnRouter::PreliminarySurfaceLevel, &noises);
+                assert_eq!(
+                    noises
+                        .router_preliminary_surface_level(&mut cache, x, 0, z)
+                        .to_bits(),
+                    expected[5]
+                );
+                cache.ensure_router(x, z, ColumnRouter::Depth, &noises);
+                for (i, y) in [-64, 0, 70, 200].into_iter().enumerate() {
+                    assert_eq!(
+                        noises.router_depth(&mut cache, x, y, z).to_bits(),
+                        expected[6 + 2 * i]
+                    );
+                }
+
+                // The column that was valid before must not reuse overwritten values.
+                cache.ensure(x + 4, z, &noises);
+                let mut other = Cache::default();
+                other.ensure(x + 4, z, &noises);
+                assert_eq!(
+                    full_column(&noises, &mut cache, x + 4, z),
+                    full_column(&noises, &mut other, x + 4, z),
+                    "({}, {z})",
+                    x + 4
+                );
+
+                cache.ensure(x, z, &noises);
+                assert_eq!(
+                    full_column(&noises, &mut cache, x, z),
+                    expected,
+                    "({x}, {z})"
+                );
+            }
+        }
+    }
 }

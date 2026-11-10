@@ -5,8 +5,8 @@ use smallvec::SmallVec;
 use std::f32::consts::PI;
 use std::time::Instant;
 use steel_math::trig;
+use steel_registry::feature::{ResolvedOreTarget, ResolvedOreTargets};
 use steel_utils::PackedSectionBlockPos;
-use steel_worldgen::state_resolver::WorldgenStateResolver;
 
 impl FeatureDecorationRunner {
     pub(in crate::worldgen::feature) fn place_ore_feature(
@@ -122,7 +122,7 @@ impl FeatureDecorationRunner {
         let profile = OreFeatureProfile::new(config.size);
         let mut placed = 0_u64;
         let mut tested = OreTestedPositions::with_capacity(search_volume.tested_position_count);
-        let targets = ResolvedOreTargets::from_config(registry, config);
+        let targets = config.resolved_targets(registry);
         let batch_no_air_exposure = config.discard_chance_on_air_exposure <= 0.0;
         let mut pending_no_air_sections = SmallVec::<[PendingOreSection; 8]>::new();
         let min_y = region.min_y();
@@ -138,9 +138,9 @@ impl FeatureDecorationRunner {
                     registry,
                     random,
                     config,
-                    &targets,
+                    targets,
                     search_volume,
-                    vein_nodes,
+                    &vein_nodes,
                     x_start,
                     y_start,
                     z_start,
@@ -156,9 +156,9 @@ impl FeatureDecorationRunner {
                     registry,
                     random,
                     config,
-                    &targets,
+                    targets,
                     search_volume,
-                    vein_nodes,
+                    &vein_nodes,
                     x_start,
                     y_start,
                     z_start,
@@ -213,7 +213,7 @@ impl FeatureDecorationRunner {
         config: &OreConfiguration,
         targets: &ResolvedOreTargets,
         search_volume: OreSearchVolume,
-        vein_nodes: SmallVec<[[f64; 4]; 32]>,
+        vein_nodes: &[[f64; 4]],
         x_start: i32,
         y_start: i32,
         z_start: i32,
@@ -225,7 +225,7 @@ impl FeatureDecorationRunner {
     ) -> u64 {
         let mut placed = 0_u64;
 
-        for node in vein_nodes {
+        for &node in vein_nodes {
             let radius = node[3];
             if radius < 0.0 {
                 continue;
@@ -256,8 +256,10 @@ impl FeatureDecorationRunner {
             let y_distances_squared = axis_distances_squared(y_min, y_max, node[1]);
             let z_distances_squared = axis_distances_squared(z_min, z_max, node[2]);
 
+            // Mins are clamped to the search-volume start, so offsets are non-negative.
+            let z_first_index = (z_min - z_start) as usize * search_volume.z_stride();
             for x in x_min..=x_max {
-                let x_offset = i64::from(x) - i64::from(x_start);
+                let x_index = (x - x_start) as usize;
                 let x_distance = (f64::from(x) + 0.5 - node[0]) / radius;
                 let x_distance_squared = x_distance * x_distance;
                 if x_distance_squared >= 1.0 {
@@ -265,14 +267,14 @@ impl FeatureDecorationRunner {
                 }
 
                 for (y, &y_distance_squared) in (y_min..=y_max).zip(&y_distances_squared) {
-                    let y_offset = i64::from(y) - i64::from(y_start);
+                    let x_y_index =
+                        x_index + (y - y_start) as usize * search_volume.y_stride() + z_first_index;
                     let x_y_distance_squared = x_distance_squared + y_distance_squared;
                     if x_y_distance_squared >= 1.0 {
                         continue;
                     }
 
-                    for (z, &z_distance_squared) in (z_min..=z_max).zip(&z_distances_squared) {
-                        let z_offset = i64::from(z) - i64::from(z_start);
+                    for (z_step, &z_distance_squared) in z_distances_squared.iter().enumerate() {
                         if x_y_distance_squared + z_distance_squared >= 1.0 {
                             continue;
                         }
@@ -280,11 +282,8 @@ impl FeatureDecorationRunner {
                         if PROFILE {
                             sections.record_ore_candidate_position();
                         }
-                        let Some(tested_index) =
-                            search_volume.index_from_offsets(x_offset, y_offset, z_offset)
-                        else {
-                            continue;
-                        };
+                        let z = z_min + z_step as i32;
+                        let tested_index = x_y_index + z_step * search_volume.z_stride();
                         if tested.insert(tested_index) {
                             if PROFILE {
                                 sections.record_ore_unique_position();
@@ -339,7 +338,7 @@ impl FeatureDecorationRunner {
             config.size
         );
 
-        let targets = ResolvedOreTargets::from_config(registry, config);
+        let targets = config.resolved_targets(registry);
         let tries = random.next_i32_bounded(config.size + 1);
         for i in 0..tries {
             let max_distance = i.min(7);
@@ -349,7 +348,7 @@ impl FeatureDecorationRunner {
                 Self::random_scattered_ore_offset(random, max_distance),
             );
             let _ =
-                Self::try_place_resolved_ore_block(region, registry, random, config, &targets, pos);
+                Self::try_place_resolved_ore_block(region, registry, random, config, targets, pos);
         }
 
         true
@@ -499,8 +498,10 @@ impl FeatureDecorationRunner {
     }
 }
 
+/// Bitset of tested positions. The inline capacity covers the largest vanilla
+/// ore volume (size 64: 26 * 14 * 26 bits), so no ore placement allocates.
 struct OreTestedPositions {
-    words: SmallVec<[u64; 16]>,
+    words: SmallVec<[u64; 160]>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -515,42 +516,19 @@ struct PendingOreSection {
     positions: SmallVec<[PackedSectionBlockPos; 256]>,
 }
 
-struct ResolvedOreTargets {
-    targets: SmallVec<[ResolvedOreTarget; 2]>,
-}
-
-struct ResolvedOreTarget {
-    matcher: ResolvedOreRuleTest,
-    state: BlockStateId,
-}
-
-enum ResolvedOreRuleTest {
-    AlwaysTrue,
-    Block(usize),
-    Tag(SmallVec<[usize; 8]>),
-    HeightRange(i32, i32),
-    Not(Box<ResolvedOreRuleTest>),
-    AllOf(Vec<ResolvedOreRuleTest>),
-    AnyOf(Vec<ResolvedOreRuleTest>),
-}
-
 #[derive(Clone, Copy)]
 struct OreSearchVolume {
-    size_xz: i64,
-    size_xz_y: i64,
+    size_xz: usize,
+    size_xz_y: usize,
     tested_position_count: usize,
 }
 
 impl OreSearchVolume {
     fn new(size_xz: i32, size_y: i32) -> Option<Self> {
-        let size_xz = i64::from(size_xz);
-        let size_y = i64::from(size_y);
-        if size_xz <= 0 || size_y <= 0 {
-            return None;
-        }
-
+        let size_xz = usize::try_from(size_xz).ok().filter(|&size| size > 0)?;
+        let size_y = usize::try_from(size_y).ok().filter(|&size| size > 0)?;
         let size_xz_y = size_xz.checked_mul(size_y)?;
-        let tested_position_count = usize::try_from(size_xz_y.checked_mul(size_xz)?).ok()?;
+        let tested_position_count = size_xz_y.checked_mul(size_xz)?;
         Some(Self {
             size_xz,
             size_xz_y,
@@ -558,120 +536,19 @@ impl OreSearchVolume {
         })
     }
 
-    #[inline]
-    fn index_from_offsets(self, x_offset: i64, y_offset: i64, z_offset: i64) -> Option<usize> {
-        if x_offset < 0 || y_offset < 0 || z_offset < 0 {
-            return None;
-        }
-
-        // Matches vanilla OreFeature's BitSet index layout.
-        let index = x_offset + y_offset * self.size_xz + z_offset * self.size_xz_y;
-        usize::try_from(index).ok()
-    }
-}
-
-impl ResolvedOreTargets {
-    fn from_config(registry: &Registry, config: &OreConfiguration) -> Self {
-        let mut targets = SmallVec::with_capacity(config.targets.len());
-        for target in &config.targets {
-            let matcher = Self::resolve_rule_test(registry, &target.target);
-            let state = WorldgenStateResolver::feature_block_state_from_data(
-                registry,
-                &target.state,
-                "ore feature",
-            );
-            targets.push(ResolvedOreTarget { matcher, state });
-        }
-
-        Self { targets }
+    // Vanilla OreFeature's BitSet index is `x + y * size_xz + z * size_xz * size_y`
+    // over offsets from the volume start.
+    const fn y_stride(self) -> usize {
+        self.size_xz
     }
 
-    fn resolve_rule_test(registry: &Registry, test: &StructureRuleTestData) -> ResolvedOreRuleTest {
-        match test {
-            StructureRuleTestData::AlwaysTrue => ResolvedOreRuleTest::AlwaysTrue,
-            StructureRuleTestData::BlockMatch { block } => {
-                let block_ref = registry
-                    .blocks
-                    .by_key(block)
-                    .unwrap_or_else(|| panic!("unknown ore target block {block}"));
-                ResolvedOreRuleTest::Block(steel_registry::RegistryEntry::id(block_ref))
-            }
-            StructureRuleTestData::TagMatch { tag } => {
-                let block_ids = registry
-                    .blocks
-                    .iter_tag(tag)
-                    .map(steel_registry::RegistryEntry::id)
-                    .collect();
-                ResolvedOreRuleTest::Tag(block_ids)
-            }
-            StructureRuleTestData::HeightMatch {
-                min_inclusive,
-                max_inclusive,
-            } => ResolvedOreRuleTest::HeightRange(*min_inclusive, *max_inclusive),
-            StructureRuleTestData::Not { rule } => {
-                ResolvedOreRuleTest::Not(Box::new(Self::resolve_rule_test(registry, rule)))
-            }
-            StructureRuleTestData::AllOf { rules } => ResolvedOreRuleTest::AllOf(
-                rules
-                    .iter()
-                    .map(|rule| Self::resolve_rule_test(registry, rule))
-                    .collect(),
-            ),
-            StructureRuleTestData::AnyOf { rules } => ResolvedOreRuleTest::AnyOf(
-                rules
-                    .iter()
-                    .map(|rule| Self::resolve_rule_test(registry, rule))
-                    .collect(),
-            ),
-            other => unreachable!("ore rule test target does not support {other:?}"),
-        }
+    const fn z_stride(self) -> usize {
+        self.size_xz_y
     }
 
-    fn iter(&self) -> impl Iterator<Item = &ResolvedOreTarget> {
-        self.targets.iter()
-    }
-
-    fn matching_replacement(
-        &self,
-        registry: &Registry,
-        state: BlockStateId,
-        y: i32,
-    ) -> Option<BlockStateId> {
-        let block_id = Self::block_id_for_state(registry, state);
-        self.targets
-            .iter()
-            .find_map(|target| target.matches(block_id, y).then_some(target.state))
-    }
-
-    fn block_id_for_state(registry: &Registry, state: BlockStateId) -> usize {
-        let Some(&block_id) = registry.blocks.state_to_block_id.get(state.0 as usize) else {
-            panic!("ore feature received invalid block state id {}", state.0);
-        };
-        block_id
-    }
-}
-
-impl ResolvedOreTarget {
-    fn matches(&self, block_id: usize, y: i32) -> bool {
-        Self::matches_rule(&self.matcher, block_id, y)
-    }
-
-    fn matches_rule(rule: &ResolvedOreRuleTest, block_id: usize, y: i32) -> bool {
-        match rule {
-            ResolvedOreRuleTest::AlwaysTrue => true,
-            ResolvedOreRuleTest::Block(target_block_id) => block_id == *target_block_id,
-            ResolvedOreRuleTest::Tag(block_ids) => block_ids.contains(&block_id),
-            ResolvedOreRuleTest::HeightRange(min_inclusive, max_inclusive) => {
-                (*min_inclusive..=*max_inclusive).contains(&y)
-            }
-            ResolvedOreRuleTest::Not(rule) => !Self::matches_rule(rule, block_id, y),
-            ResolvedOreRuleTest::AllOf(rules) => rules
-                .iter()
-                .all(|rule| Self::matches_rule(rule, block_id, y)),
-            ResolvedOreRuleTest::AnyOf(rules) => rules
-                .iter()
-                .any(|rule| Self::matches_rule(rule, block_id, y)),
-        }
+    #[cfg(test)]
+    const fn index_from_offsets(self, x_offset: usize, y_offset: usize, z_offset: usize) -> usize {
+        x_offset + y_offset * self.y_stride() + z_offset * self.z_stride()
     }
 }
 
@@ -715,10 +592,11 @@ impl OreTestedPositions {
         }
     }
 
+    #[inline]
     fn insert(&mut self, index: usize) -> bool {
         let word_index = index / u64::BITS as usize;
         if word_index >= self.words.len() {
-            self.words.resize(word_index + 1, 0);
+            self.grow(word_index);
         }
 
         let mask = 1_u64 << (index % u64::BITS as usize);
@@ -730,6 +608,12 @@ impl OreTestedPositions {
         *word |= mask;
         true
     }
+
+    /// Vanilla's `BitSet` grows for the inclusive far edges of the volume.
+    #[cold]
+    fn grow(&mut self, word_index: usize) {
+        self.words.resize(word_index + 1, 0);
+    }
 }
 
 #[cfg(test)]
@@ -740,7 +624,7 @@ mod tests {
     fn ore_tested_position_index_matches_vanilla_layout() {
         let volume = OreSearchVolume::new(4, 6);
         assert_eq!(
-            volume.and_then(|volume| volume.index_from_offsets(2, 3, 1)),
+            volume.map(|volume| volume.index_from_offsets(2, 3, 1)),
             Some(38)
         );
     }
@@ -749,11 +633,11 @@ mod tests {
     fn ore_tested_position_index_keeps_vanilla_inclusive_edge_layout() {
         let volume = OreSearchVolume::new(4, 6);
         assert_eq!(
-            volume.and_then(|volume| volume.index_from_offsets(4, 0, 0)),
+            volume.map(|volume| volume.index_from_offsets(4, 0, 0)),
             Some(4)
         );
         assert_eq!(
-            volume.and_then(|volume| volume.index_from_offsets(0, 1, 0)),
+            volume.map(|volume| volume.index_from_offsets(0, 1, 0)),
             Some(4)
         );
     }

@@ -9,8 +9,10 @@ use rustc_hash::FxHashMap;
 use steel_utils::Identifier;
 
 pub mod data;
+mod ore;
 
 pub use data::*;
+pub use ore::{ResolvedOreTarget, ResolvedOreTargets};
 
 /// A fully-configured feature registry entry.
 #[derive(Debug)]

@@ -179,6 +179,153 @@ pub(super) fn collect_inline_flat_noises(
         _ => {}
     }
 }
+/// Calls `visit` on each direct child of `df`, in the same set that
+/// [`collect_refs_inner`] walks.
+fn for_each_child(df: &DensityFunction, visit: &mut impl FnMut(&DensityFunction)) {
+    match df {
+        DensityFunction::Marker(m) => visit(&m.wrapped),
+        DensityFunction::TwoArgumentSimple(t) => {
+            visit(&t.argument1);
+            visit(&t.argument2);
+        }
+        DensityFunction::Lerp(l) => {
+            visit(&l.alpha);
+            visit(&l.first);
+            visit(&l.second);
+        }
+        DensityFunction::Mapped(m) => visit(&m.input),
+        DensityFunction::Clamp(c) => visit(&c.input),
+        DensityFunction::RangeChoice(rc) => {
+            visit(&rc.input);
+            visit(&rc.when_in_range);
+            visit(&rc.when_out_of_range);
+        }
+        DensityFunction::IntervalSelect(interval) => {
+            visit(&interval.input);
+            for function in &interval.functions {
+                visit(function);
+            }
+        }
+        DensityFunction::ShiftedNoise(sn) => {
+            visit(&sn.shift_x);
+            visit(&sn.shift_y);
+            visit(&sn.shift_z);
+        }
+        DensityFunction::BlendDensity(bd) => visit(&bd.input),
+        DensityFunction::WeirdScaledSampler(ws) => visit(&ws.input),
+        DensityFunction::Slice(s) => visit(&s.input),
+        DensityFunction::Spline(s) => for_each_spline_child(&s.spline, visit),
+        DensityFunction::FindTopSurface(fts) => {
+            visit(&fts.density);
+            visit(&fts.upper_bound);
+        }
+        _ => {}
+    }
+}
+
+fn for_each_spline_child(spline: &CubicSpline, visit: &mut impl FnMut(&DensityFunction)) {
+    visit(&spline.coordinate);
+    for point in &spline.points {
+        if let SplineValue::Spline(nested) = &point.value {
+            for_each_spline_child(nested, visit);
+        }
+    }
+}
+
+/// Column cache values that evaluating `df` reads: flat-cached functions
+/// (with their own inputs) and the fingerprints of Y-independent noises that
+/// non-flat code reads from the cache instead of sampling.
+pub(super) fn collect_column_reads(
+    df: &DensityFunction,
+    registry: &BTreeMap<String, DensityFunction>,
+    flat_cached: &BTreeSet<String>,
+    flat_context: bool,
+    flat_reads: &mut BTreeSet<String>,
+    inline_noise_reads: &mut BTreeSet<u64>,
+) {
+    match df {
+        DensityFunction::Reference(r) => {
+            let Some(target) = registry.get(&r.id) else {
+                return;
+            };
+            if flat_cached.contains(&r.id) {
+                if flat_reads.insert(r.id.clone()) {
+                    collect_column_reads(
+                        target,
+                        registry,
+                        flat_cached,
+                        true,
+                        flat_reads,
+                        inline_noise_reads,
+                    );
+                }
+            } else {
+                // Called as a separately generated non-flat function.
+                collect_column_reads(
+                    target,
+                    registry,
+                    flat_cached,
+                    false,
+                    flat_reads,
+                    inline_noise_reads,
+                );
+            }
+        }
+        DensityFunction::Noise(n) if !flat_context && n.y_scale == 0.0 => {
+            inline_noise_reads.insert(fingerprint(df));
+        }
+        _ => for_each_child(df, &mut |child| {
+            collect_column_reads(
+                child,
+                registry,
+                flat_cached,
+                flat_context,
+                flat_reads,
+                inline_noise_reads,
+            );
+        }),
+    }
+}
+
+/// Whether `df` can read the blended noise at block `y`. A `Lerp` whose alpha
+/// is exactly 0 or 1 there returns that side alone, as the generated code does.
+pub(super) fn reads_blended_noise_at_y(
+    df: &DensityFunction,
+    registry: &BTreeMap<String, DensityFunction>,
+    y: i32,
+) -> bool {
+    let reads = |df: &DensityFunction| reads_blended_noise_at_y(df, registry, y);
+    match df {
+        DensityFunction::BlendedNoise(_) => true,
+        DensityFunction::Reference(r) => registry.get(&r.id).is_some_and(reads),
+        DensityFunction::Lerp(l) => match value_at_y(&l.alpha, y) {
+            Some(0.0) => reads(&l.first),
+            Some(1.0) => reads(&l.second),
+            _ => reads(&l.alpha) || reads(&l.first) || reads(&l.second),
+        },
+        _ => {
+            let mut any = false;
+            for_each_child(df, &mut |child| any = any || reads(child));
+            any
+        }
+    }
+}
+
+/// The value of a Y-only function at block `y`, computed as the generated code
+/// computes it.
+fn value_at_y(df: &DensityFunction, y: i32) -> Option<f32> {
+    match df {
+        DensityFunction::Constant(c) => Some(c.value as f32),
+        DensityFunction::YClampedGradient(g) => {
+            let coordinate = y.clamp(g.from_y, g.to_y) - g.from_y;
+            let from = g.from_value as f32;
+            let to = g.to_value as f32;
+            Some(from + coordinate as f32 * ((to - from) / (g.to_y - g.from_y) as f32))
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn collect_spline_refs(spline: &CubicSpline, refs: &mut Vec<String>) {
     collect_refs_inner(&spline.coordinate, refs);
     for point in &spline.points {

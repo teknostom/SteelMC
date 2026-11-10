@@ -1333,6 +1333,17 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
             }
 
             #[inline]
+            fn ensure_router(
+                &mut self,
+                x: i32,
+                z: i32,
+                router: steel_worldgen::density::ColumnRouter,
+                noises: &Self::Noises,
+            ) {
+                #cache_struct::ensure_router(self, x, z, router, noises)
+            }
+
+            #[inline]
             fn init_grid(&mut self, chunk_block_x: i32, chunk_block_z: i32, noises: &Self::Noises) {
                 #cache_struct::init_grid(self, chunk_block_x, chunk_block_z, noises)
             }
@@ -1397,6 +1408,10 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
                 INTERPOLATED_COUNT
             }
 
+            #[inline]
+            fn blended_noise_corner_y_range() -> (i32, i32) {
+                BLENDED_NOISE_CORNER_Y_RANGE
+            }
             fn vein_interp_enabled() -> bool {
                 VEIN_INTERP_ENABLED
             }
@@ -1424,6 +1439,16 @@ fn generate_noise_settings(dimension: &str, prefix: &str) -> TokenStream {
             #[inline]
             fn combine_interpolated(&self, cache: &mut Self::ColumnCache, interpolated: &[f32], x: i32, y: i32, z: i32) -> f32 {
                 combine_interpolated(self, cache, interpolated, x, y, z)
+            }
+
+            #[inline]
+            fn combine_interpolated_y_simd<const N: usize, const W: usize>(
+                &self,
+                cache: &mut Self::ColumnCache,
+                interpolated: &[[f32; W]; N],
+                ys: [i32; N],
+            ) -> [f32; N] {
+                combine_interpolated_y_simd(self, cache, interpolated, ys)
             }
 
             #[inline]

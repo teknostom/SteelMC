@@ -3,11 +3,14 @@
 //! Emits noise generator fields, seed-based constructors (including legacy-random
 //! overrides), and the per-column flat-cache with optional grid backing stores.
 
+use std::collections::BTreeSet;
+
 use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
 
 use super::TranspilerInput;
 use super::context::TranspileContext;
+use super::graph::{collect_column_reads, unwrap_markers};
 use super::naming::{
     grid_field_ident, named_fn_field_ident, named_fn_ident, noise_field_ident,
     router_cache_field_ident, router_compute_fn_ident, router_grid_field_ident,
@@ -380,6 +383,8 @@ impl TranspileContext {
             })
             .collect();
 
+        let ensure_router_fn = self.gen_ensure_router(input, &flat_names);
+
         let noises = &self.noises_ident;
         let cache = &self.cache_ident;
         quote! {
@@ -402,6 +407,11 @@ impl TranspileContext {
                 /// Z coordinate used to evaluate the cached values.
                 qz: i32,
                 valid: bool,
+                /// Values [`Self::ensure_router`] computed at `partial_x`/`partial_z`,
+                /// one bit per active field in `ensure` order.
+                partial_mask: u64,
+                partial_x: i32,
+                partial_z: i32,
                 // ── Grid backing store ──
                 grid_first_quart_x: i32,
                 grid_first_quart_z: i32,
@@ -429,6 +439,9 @@ impl TranspileContext {
                         qx: i32::MIN,
                         qz: i32::MIN,
                         valid: false,
+                        partial_mask: 0,
+                        partial_x: 0,
+                        partial_z: 0,
                         grid_first_quart_x: 0,
                         grid_first_quart_z: 0,
                         has_grid: false,
@@ -452,6 +465,7 @@ impl TranspileContext {
                     self.grid_first_quart_z = chunk_block_z >> 2;
                     self.has_grid = true;
                     self.valid = false;
+                    self.partial_mask = 0;
 
                     // Pre-compute all grid positions in topological order.
                     // For each position, write to active fields first (so
@@ -505,6 +519,7 @@ impl TranspileContext {
                             self.qx = eval_x;
                             self.qz = eval_z;
                             self.valid = true;
+                            self.partial_mask = 0;
                             return;
                         }
                         // Non-grid position: compute on the fly at exact coordinates.
@@ -519,6 +534,7 @@ impl TranspileContext {
                         #(#router_ensure_stmts)*
                         #(#inline_noise_ensure_stmts)*
                         self.valid = true;
+                            self.partial_mask = 0;
                         return;
                     }
 
@@ -534,7 +550,158 @@ impl TranspileContext {
                     #(#router_ensure_stmts)*
                     #(#inline_noise_ensure_stmts)*
                     self.valid = true;
+                            self.partial_mask = 0;
                 }
+
+                #ensure_router_fn
+            }
+        }
+    }
+
+    /// `ensure_router`: evaluates only the column values one router entry
+    /// reads, so a caller needing a single router value at an arbitrary column
+    /// skips the rest of the column.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "field bits, router masks and the emitted method share one numbering"
+    )]
+    fn gen_ensure_router(&self, input: &TranspilerInput, flat_names: &[&String]) -> TokenStream {
+        // One bit per active field, in the order `ensure` computes them.
+        let flat_routers: Vec<&String> = self.flat_routers.iter().collect();
+        let inline_noises: Vec<(&u64, &(usize, String, f64))> =
+            self.inline_flat_noises.iter().collect();
+        let field_count = flat_names.len() + flat_routers.len() + inline_noises.len();
+        assert!(
+            field_count <= 64,
+            "ensure_router tracks {field_count} column fields in a u64"
+        );
+
+        let mut bit = 0_u32;
+        let mut guarded_stmts = Vec::new();
+        for name in flat_names {
+            let field = named_fn_field_ident(name);
+            let compute_fn = named_fn_ident(name);
+            let mask = Literal::u64_suffixed(1 << bit);
+            guarded_stmts.push(quote! {
+                if missing & #mask != 0 {
+                    self.#field = #compute_fn(noises, &*self, x, z);
+                }
+            });
+            bit += 1;
+        }
+        for name in &flat_routers {
+            let field = router_cache_field_ident(name);
+            let compute_fn = router_compute_fn_ident(name);
+            let mask = Literal::u64_suffixed(1 << bit);
+            guarded_stmts.push(quote! {
+                if missing & #mask != 0 {
+                    self.#field = #compute_fn(noises, &*self, x, z);
+                }
+            });
+            bit += 1;
+        }
+        for (_, (idx, noise_id, xz_scale)) in &inline_noises {
+            let field = format_ident!("inline_noise_{}", idx);
+            let noise_field = noise_field_ident(noise_id);
+            let scale = Literal::f64_unsuffixed(*xz_scale);
+            let mask = Literal::u64_suffixed(1 << bit);
+            guarded_stmts.push(quote! {
+                if missing & #mask != 0 {
+                    self.#field = noises.#noise_field.get_value_xz(x * #scale, z * #scale);
+                }
+            });
+            bit += 1;
+        }
+
+        let router_mask = |router: &str| -> Option<u64> {
+            let df = input.router_entries.get(router)?;
+            let flat = self.flat_routers.contains(router);
+            let mut flat_reads = BTreeSet::new();
+            let mut inline_reads = BTreeSet::new();
+            collect_column_reads(
+                unwrap_markers(df),
+                &input.registry,
+                &self.flat_cached,
+                flat,
+                &mut flat_reads,
+                &mut inline_reads,
+            );
+            let mut mask = 0_u64;
+            for (i, name) in flat_names.iter().enumerate() {
+                if flat_reads.contains(*name) {
+                    mask |= 1 << i;
+                }
+            }
+            if let Some(i) = flat_routers.iter().position(|name| *name == router) {
+                mask |= 1 << (flat_names.len() + i);
+            }
+            for (i, (fingerprint, _)) in inline_noises.iter().enumerate() {
+                if inline_reads.contains(*fingerprint) {
+                    mask |= 1 << (flat_names.len() + flat_routers.len() + i);
+                }
+            }
+            Some(mask)
+        };
+
+        let arms: Vec<TokenStream> = [
+            ("erosion", quote! { Erosion }),
+            ("depth", quote! { Depth }),
+            (
+                "preliminary_surface_level",
+                quote! { PreliminarySurfaceLevel },
+            ),
+        ]
+        .into_iter()
+        .map(|(router, variant)| {
+            // Without that entry the router reads nothing from the column.
+            let mask = Literal::u64_suffixed(router_mask(router).unwrap_or(0));
+            quote! { steel_worldgen::density::ColumnRouter::#variant => #mask }
+        })
+        .collect();
+
+        let noises = &self.noises_ident;
+        quote! {
+            /// Like [`Self::ensure`], but evaluates only the column values `router`
+            /// reads. The full cache is left stale, so a later `ensure` recomputes.
+            pub fn ensure_router(
+                &mut self,
+                x: i32,
+                z: i32,
+                router: steel_worldgen::density::ColumnRouter,
+                noises: &#noises,
+            ) {
+                if self.valid && self.qx == x && self.qz == z {
+                    self.x = x;
+                    self.z = z;
+                    return;
+                }
+                if self.has_grid && x & 3 == 0 && z & 3 == 0 {
+                    let rel_x = (x >> 2) - self.grid_first_quart_x;
+                    let rel_z = (z >> 2) - self.grid_first_quart_z;
+                    if rel_x >= 0 && rel_z >= 0 && rel_x < Self::GRID_SIDE && rel_z < Self::GRID_SIDE {
+                        self.ensure(x, z, noises);
+                        return;
+                    }
+                }
+                self.x = x;
+                self.z = z;
+                if self.partial_mask == 0 || self.partial_x != x || self.partial_z != z {
+                    self.partial_mask = 0;
+                    self.partial_x = x;
+                    self.partial_z = z;
+                }
+                let needed: u64 = match router {
+                    #(#arms,)*
+                };
+                let missing = needed & !self.partial_mask;
+                if missing == 0 {
+                    return;
+                }
+                self.valid = false;
+                let x = x as f64;
+                let z = z as f64;
+                #(#guarded_stmts)*
+                self.partial_mask |= missing;
             }
         }
     }

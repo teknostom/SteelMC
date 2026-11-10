@@ -128,6 +128,8 @@ struct BeardColumns {
     rigid_indices: Vec<u32>,
     junction_offsets: Box<[u32]>,
     junction_indices: Vec<u32>,
+    /// Per column, the inclusive Y span its pieces can reach.
+    vertical_reach: Box<[(i32, i32)]>,
 }
 
 impl BeardColumns {
@@ -141,6 +143,7 @@ impl BeardColumns {
         let mut rigid_indices = Vec::new();
         let mut junction_offsets = Vec::with_capacity(257);
         let mut junction_indices = Vec::new();
+        let mut vertical_reach = Vec::with_capacity(256);
         rigid_offsets.push(0);
         junction_offsets.push(0);
         let reach = -CONTRIBUTION_REACH..CONTRIBUTION_REACH;
@@ -148,10 +151,15 @@ impl BeardColumns {
             let block_z = chunk_start_z + local_z;
             for local_x in 0..16 {
                 let block_x = chunk_start_x + local_x;
+                let mut column_reach = (i32::MAX, i32::MIN);
+                let mut widen = |(min_y, max_y): (i32, i32)| {
+                    column_reach = (column_reach.0.min(min_y), column_reach.1.max(max_y));
+                };
                 for (index, rigid) in (0u32..).zip(rigids) {
                     let (dx, dz) = rigid.horizontal_distance(block_x, block_z);
                     if dx < CONTRIBUTION_REACH && dz < CONTRIBUTION_REACH {
                         rigid_indices.push(index);
+                        widen(rigid.vertical_reach());
                     }
                 }
                 for (index, junction) in (0u32..).zip(junctions) {
@@ -159,8 +167,10 @@ impl BeardColumns {
                         && reach.contains(&(block_z - junction.source_pos.z))
                     {
                         junction_indices.push(index);
+                        widen(junction_vertical_reach(junction));
                     }
                 }
+                vertical_reach.push(column_reach);
                 rigid_offsets.push(Self::offset(rigid_indices.len()));
                 junction_offsets.push(Self::offset(junction_indices.len()));
             }
@@ -170,6 +180,7 @@ impl BeardColumns {
             rigid_indices,
             junction_offsets: junction_offsets.into_boxed_slice(),
             junction_indices,
+            vertical_reach: vertical_reach.into_boxed_slice(),
         }
     }
 
@@ -186,6 +197,27 @@ impl BeardColumns {
 }
 
 impl Rigid {
+    /// Inclusive Y range outside which this piece contributes exactly `+0.0`:
+    /// every kernel reaches at most [`CONTRIBUTION_REACH`] blocks vertically.
+    const fn vertical_reach(&self) -> (i32, i32) {
+        let bb = &self.bounding_box;
+        let ground_y = bb.min_y() + self.ground_level_delta;
+        match self.terrain_adjustment {
+            TerrainAdjustment::None => (i32::MAX, i32::MIN),
+            TerrainAdjustment::Bury | TerrainAdjustment::BeardThin => {
+                (ground_y - CONTRIBUTION_REACH, ground_y + CONTRIBUTION_REACH)
+            }
+            TerrainAdjustment::BeardBox => (
+                ground_y - CONTRIBUTION_REACH,
+                bb.max_y() + CONTRIBUTION_REACH,
+            ),
+            TerrainAdjustment::Encapsulate => (
+                bb.min_y() - CONTRIBUTION_REACH,
+                bb.max_y() + CONTRIBUTION_REACH,
+            ),
+        }
+    }
+
     /// Horizontal distance to the bounding box, 0 when inside it.
     fn horizontal_distance(&self, block_x: i32, block_z: i32) -> (i32, i32) {
         let bb = &self.bounding_box;
@@ -218,6 +250,14 @@ impl Rigid {
             }
         }
     }
+}
+
+/// Inclusive Y range outside which a junction contributes exactly `+0.0`.
+const fn junction_vertical_reach(junction: &JigsawJunction) -> (i32, i32) {
+    (
+        junction.source_pos.y - CONTRIBUTION_REACH,
+        junction.source_pos.y + CONTRIBUTION_REACH,
+    )
 }
 
 fn junction_contribution(
@@ -370,15 +410,26 @@ impl Beardifier {
 
         let column = (local_z * 16 + local_x) as usize;
         let columns = &self.columns;
+        // Pieces out of vertical reach add exactly `+0.0`; the sum starts at
+        // `+0.0` and so cannot become `-0.0`, so skipping them is exact.
+        let in_reach = |(min_y, max_y): (i32, i32)| (min_y..=max_y).contains(&block_y);
+        if !in_reach(columns.vertical_reach[column]) {
+            return 0.0;
+        }
         let mut value = 0.0f32;
         for &index in &columns.rigid_indices[BeardColumns::range(&columns.rigid_offsets, column)] {
-            value += self.rigids[index as usize].contribution(block_x, block_y, block_z);
+            let rigid = &self.rigids[index as usize];
+            if in_reach(rigid.vertical_reach()) {
+                value += rigid.contribution(block_x, block_y, block_z);
+            }
         }
         for &index in
             &columns.junction_indices[BeardColumns::range(&columns.junction_offsets, column)]
         {
-            value +=
-                junction_contribution(&self.junctions[index as usize], block_x, block_y, block_z);
+            let junction = &self.junctions[index as usize];
+            if in_reach(junction_vertical_reach(junction)) {
+                value += junction_contribution(junction, block_x, block_y, block_z);
+            }
         }
         f64::from(value)
     }
@@ -483,7 +534,7 @@ mod tests {
         };
 
         let mut nonzero = 0;
-        for y in -16..48 {
+        for y in -40..72 {
             for z in 0..16 {
                 for x in 0..16 {
                     let indexed = beardifier.compute(x, y, z);

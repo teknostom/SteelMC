@@ -406,6 +406,7 @@ pub(super) fn generate_configured_feature_kind(kind: &ConfiguredFeatureKind) -> 
                     targets: #targets,
                     size: #size,
                     discard_chance_on_air_exposure: #discard_chance_on_air_exposure,
+                    resolved_targets: ::std::sync::OnceLock::new(),
                 })
             }
         }
@@ -529,6 +530,7 @@ pub(super) fn generate_configured_feature_kind(kind: &ConfiguredFeatureKind) -> 
                     targets: #targets,
                     size: #size,
                     discard_chance_on_air_exposure: #discard_chance_on_air_exposure,
+                    resolved_targets: ::std::sync::OnceLock::new(),
                 })
             }
         }

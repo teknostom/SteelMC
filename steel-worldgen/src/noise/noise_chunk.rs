@@ -9,6 +9,7 @@
 //!
 //! Cell dimensions depend on the dimension's noise settings.
 
+use std::array;
 use std::marker::PhantomData;
 use std::simd::f32x4;
 
@@ -19,14 +20,36 @@ use steel_worldgen::density::{ColumnCache, DimensionNoises, NoiseSettings};
 use crate::noise::{Beardifier, CornerColumnStore};
 
 /// Maximum number of interpolation channels supported.
-const MAX_INTERP: usize = 16;
+pub const MAX_INTERP: usize = 16;
 const INTERPOLATION_LANES: usize = 4;
 
 /// Maximum slice length (`z_corners` * `corners_y`) across all dimensions.
 /// Overworld: (16/4+1) * (384/8+1) = 5 * 49 = 245. Rounded up for headroom.
 const MAX_SLICE_LEN: usize = 256;
 /// The largest Vanilla noise cell height (overworld's is 8).
-const MAX_CELL_HEIGHT: usize = 16;
+pub const MAX_CELL_HEIGHT: usize = 16;
+/// Y values combined per SIMD batch; divides [`MAX_CELL_HEIGHT`].
+const COMBINE_LANES: usize = 8;
+
+/// One block column's part of a noise cell, passed to [`NoiseChunk::fill`]'s
+/// callback. Rows past the dimension's cell height are unspecified.
+pub struct CellColumn<'a> {
+    /// Chunk-local block X.
+    pub local_x: usize,
+    /// Chunk-local block Z.
+    pub local_z: usize,
+    /// World block X.
+    pub world_x: i32,
+    /// World block Z.
+    pub world_z: i32,
+    /// World Y of the cell's lowest block.
+    pub min_y: i32,
+    /// Final density per Y within the cell, beardifier included.
+    pub densities: &'a [f32; MAX_CELL_HEIGHT],
+    /// Interpolated channel values per Y within the cell; the first
+    /// [`DimensionNoises::interpolated_count`] of each row are set.
+    pub interpolated: &'a [[f32; MAX_INTERP]; MAX_CELL_HEIGHT],
+}
 
 /// Stores density values at cell corners for a single chunk and provides
 /// trilinear interpolation between corners for block-level resolution.
@@ -190,8 +213,17 @@ impl<N: DimensionNoises> NoiseChunk<N> {
             // Ensure column cache for this (x, z)
             cache.ensure(block_x, block_z, noises);
 
-            // SIMD-batch blended noise for the entire Y column.
-            noises.compute_noise_column(block_x, block_ys, block_z, blended_column);
+            // SIMD-batch blended noise for the corners that can read it; the
+            // rest keep the zeros they were created with.
+            let (blended_min_y, blended_max_y) = N::blended_noise_corner_y_range();
+            let first = block_ys.partition_point(|&y| y < blended_min_y);
+            let end = block_ys.partition_point(|&y| y <= blended_max_y).max(first);
+            noises.compute_noise_column(
+                block_x,
+                &block_ys[first..end],
+                block_z,
+                &mut blended_column[first..end],
+            );
 
             let (y_batches, y_tail) = block_ys.as_chunks::<SIMD_BATCH>();
             let (blended_batches, blended_tail) = blended_column.as_chunks::<SIMD_BATCH>();
@@ -255,16 +287,18 @@ impl<N: DimensionNoises> NoiseChunk<N> {
 
     /// Fill the chunk with terrain blocks using multi-channel trilinear interpolation.
     ///
-    /// For each block position:
+    /// For each block column of each cell, top cell first:
     /// 1. Trilinearly interpolate each channel independently from cell corners
     /// 2. Apply outer operations (squeeze, min, etc.) via `combine_interpolated`
-    /// 3. Call `place_block` with the final density
+    ///    and add the beardifier
+    /// 3. Call `place_cell_column`, which visits the cell's blocks top-down
     ///
     /// Cells at or above `unsampled_air_min_y` whose proving channels
     /// ([`DimensionNoises::final_density_nonpositive_channels`]) are `<= 0`
     /// at every interpolated block value, and that the beardifier cannot reach,
-    /// are skipped without calling `place_block`: their density is non-positive,
-    /// which the caller guarantees places nothing and changes no state there.
+    /// are skipped without calling `place_cell_column`: their density is
+    /// non-positive, which the caller guarantees places nothing and changes no
+    /// state there.
     #[expect(
         clippy::too_many_lines,
         reason = "keeps the cell interpolation and block traversal together"
@@ -276,9 +310,9 @@ impl<N: DimensionNoises> NoiseChunk<N> {
         beardifier: Option<&Beardifier>,
         unsampled_air_min_y: i32,
         corner_columns: &CornerColumnStore,
-        mut place_block: F,
+        mut place_cell_column: F,
     ) where
-        F: FnMut(usize, i32, usize, f32, &[f32], &mut N::ColumnCache),
+        F: FnMut(&CellColumn<'_>, &mut N::ColumnCache),
     {
         let cell_width = N::Settings::CELL_WIDTH;
         let cell_height = N::Settings::CELL_HEIGHT;
@@ -408,30 +442,22 @@ impl<N: DimensionNoises> NoiseChunk<N> {
 
                     for z_in_cell in 0..cell_width {
                         let local_z = (cell_z_idx as i32 * cell_width + z_in_cell) as usize;
+                        // Every channel read below is written first for its cell.
+                        let mut values_by_y = [[0.0_f32; MAX_INTERP]; MAX_CELL_HEIGHT];
 
                         for cell_y_idx in (0..cell_count_y).rev() {
                             let cell_world_y = (self.cell_min_y + cell_y_idx as i32) * cell_height;
                             let row =
                                 (z_in_cell as usize * corners_y + cell_y_idx) * channel_batches;
-                            let mut values_by_y = [[0.0_f32; MAX_INTERP]; MAX_CELL_HEIGHT];
-
                             if N::interpolated_count() <= INTERPOLATION_LANES {
-                                for (batch, channel) in
-                                    (0..interp_count).step_by(INTERPOLATION_LANES).enumerate()
-                                {
-                                    let [v00, v10] = z_partials[row + batch];
-                                    let [v01, v11] = z_partials[row + channel_batches + batch];
-                                    let v0 = v00 + factor_x_v * (v10 - v00);
-                                    let v1 = v01 + factor_x_v * (v11 - v01);
-                                    let step = (v1 - v0) * inverse_height;
-                                    let mut value = v0 + step * f32x4::splat(0.0);
-
-                                    for values in values_by_y.iter_mut().take(y_count) {
-                                        values[channel..channel + INTERPOLATION_LANES]
-                                            .copy_from_slice(&value.to_array());
-                                        value += step;
-                                    }
-                                }
+                                Self::interpolate_cell_y(
+                                    all_batches,
+                                    &z_partials,
+                                    row,
+                                    factor_x_v,
+                                    inverse_height,
+                                    &mut values_by_y,
+                                );
 
                                 if air_cells[cell_y_idx]
                                     && air_channels.is_some_and(|channels| {
@@ -445,29 +471,16 @@ impl<N: DimensionNoises> NoiseChunk<N> {
                                 }
                             } else {
                                 let fill_batches =
-                                    |batches: usize, values_by_y: &mut [[f32; MAX_INTERP]]| {
-                                        for (batch, channel) in (0..interp_count)
-                                            .step_by(INTERPOLATION_LANES)
-                                            .enumerate()
-                                        {
-                                            if batches & (1 << batch) == 0 {
-                                                continue;
-                                            }
-
-                                            let [v00, v10] = z_partials[row + batch];
-                                            let [v01, v11] =
-                                                z_partials[row + channel_batches + batch];
-                                            let v0 = v00 + factor_x_v * (v10 - v00);
-                                            let v1 = v01 + factor_x_v * (v11 - v01);
-                                            let step = (v1 - v0) * inverse_height;
-                                            let mut value = v0 + step * f32x4::splat(0.0);
-
-                                            for values in values_by_y.iter_mut().take(y_count) {
-                                                values[channel..channel + INTERPOLATION_LANES]
-                                                    .copy_from_slice(&value.to_array());
-                                                value += step;
-                                            }
-                                        }
+                                    |batches: usize,
+                                     values_by_y: &mut [[f32; MAX_INTERP]; MAX_CELL_HEIGHT]| {
+                                        Self::interpolate_cell_y(
+                                            batches,
+                                            &z_partials,
+                                            row,
+                                            factor_x_v,
+                                            inverse_height,
+                                            values_by_y,
+                                        );
                                     };
                                 let first_batches = if air_cells[cell_y_idx] {
                                     proving_batches
@@ -494,47 +507,60 @@ impl<N: DimensionNoises> NoiseChunk<N> {
                                 }
                             }
 
-                            for y_in_cell in (0..cell_height).rev() {
-                                let world_y = cell_world_y + y_in_cell;
-                                let interpolated = &values_by_y[y_in_cell as usize][..interp_count];
-
-                                // Apply outer operations per-block.
-                                // x/z are 0 because vanilla's outer operations (squeeze, add, mul,
-                                // quarter_negative, blend_alpha, blend_offset) are x/z-independent;
-                                // only Y matters for YClampedGradient.
-                                let mut density = noises.combine_interpolated(
-                                    cache,
-                                    &interpolated[..interp_count],
-                                    0,
-                                    world_y,
-                                    0,
-                                );
-
-                                // Vanilla integrates beardifier as `add(final_density, beardifier)`
-                                // wrapped in `cacheAllInCell` — i.e. evaluated per-block, after the
-                                // outer ops on `final_density` have run. Adding it at cell corners
-                                // would put it inside the squeeze and trilerp it linearly across
-                                // the cell, both of which diverge from vanilla for large beardifier
-                                // values inside a structure's pieces.
-                                let world_x = cell_x_idx as i32 * cell_width
-                                    + x_in_cell
-                                    + self.first_cell_x * cell_width;
-                                let world_z = cell_z_idx as i32 * cell_width
-                                    + z_in_cell
-                                    + self.first_cell_z * cell_width;
-                                if let Some(beard) = beardifier {
-                                    density += beard.compute(world_x, world_y, world_z) as f32;
-                                }
-
-                                place_block(
-                                    local_x,
-                                    world_y,
-                                    local_z,
-                                    density,
-                                    &interpolated[..interp_count],
-                                    cache,
+                            // Apply the outer operations (squeeze, min, ...) to every Y of
+                            // the cell at once; lanes past the cell height are ignored.
+                            let mut densities = [0.0_f32; MAX_CELL_HEIGHT];
+                            for (batch, rows) in values_by_y
+                                .as_chunks::<COMBINE_LANES>()
+                                .0
+                                .iter()
+                                .take(y_count.div_ceil(COMBINE_LANES))
+                                .enumerate()
+                            {
+                                let start = batch * COMBINE_LANES;
+                                let ys =
+                                    array::from_fn(|lane| cell_world_y + (start + lane) as i32);
+                                densities[start..start + COMBINE_LANES].copy_from_slice(
+                                    &noises.combine_interpolated_y_simd(cache, rows, ys),
                                 );
                             }
+
+                            // Vanilla integrates beardifier as `add(final_density, beardifier)`
+                            // wrapped in `cacheAllInCell` — i.e. evaluated per-block, after the
+                            // outer ops on `final_density` have run. Adding it at cell corners
+                            // would put it inside the squeeze and trilerp it linearly across
+                            // the cell, both of which diverge from vanilla for large beardifier
+                            // values inside a structure's pieces.
+                            let world_x = cell_x_idx as i32 * cell_width
+                                + x_in_cell
+                                + self.first_cell_x * cell_width;
+                            let world_z = cell_z_idx as i32 * cell_width
+                                + z_in_cell
+                                + self.first_cell_z * cell_width;
+                            if let Some(beard) = beardifier {
+                                for (y_in_cell, density) in
+                                    densities.iter_mut().take(y_count).enumerate()
+                                {
+                                    *density += beard.compute(
+                                        world_x,
+                                        cell_world_y + y_in_cell as i32,
+                                        world_z,
+                                    ) as f32;
+                                }
+                            }
+
+                            place_cell_column(
+                                &CellColumn {
+                                    local_x,
+                                    local_z,
+                                    world_x,
+                                    world_z,
+                                    min_y: cell_world_y,
+                                    densities: &densities,
+                                    interpolated: &values_by_y,
+                                },
+                                cache,
+                            );
                         }
                     }
                 }
@@ -542,6 +568,42 @@ impl<N: DimensionNoises> NoiseChunk<N> {
 
             // No swap needed: all slices are pre-filled and indexed directly
             // via `self.slices[cell_x_idx]` / `[cell_x_idx + 1]`.
+        }
+    }
+
+    /// Interpolates the selected four-channel `batches` of one block column
+    /// through a cell, stepping Y by repeated addition as Vanilla does.
+    #[expect(
+        clippy::inline_always,
+        reason = "keeps the per-cell loop bounds constant in the block loop"
+    )]
+    #[inline(always)]
+    fn interpolate_cell_y(
+        batches: usize,
+        z_partials: &[[f32x4; 2]],
+        row: usize,
+        factor_x: f32x4,
+        inverse_height: f32x4,
+        values_by_y: &mut [[f32; MAX_INTERP]; MAX_CELL_HEIGHT],
+    ) {
+        let channel_batches = N::interpolated_count().div_ceil(INTERPOLATION_LANES);
+        let cell_height = N::Settings::CELL_HEIGHT as usize;
+        for batch in 0..channel_batches {
+            if batches & (1 << batch) == 0 {
+                continue;
+            }
+            let channel = batch * INTERPOLATION_LANES;
+            let [v00, v10] = z_partials[row + batch];
+            let [v01, v11] = z_partials[row + channel_batches + batch];
+            let v0 = v00 + factor_x * (v10 - v00);
+            let v1 = v01 + factor_x * (v11 - v01);
+            let step = (v1 - v0) * inverse_height;
+            let mut value = v0 + step * f32x4::splat(0.0);
+
+            for values in &mut values_by_y[..cell_height] {
+                values[channel..channel + INTERPOLATION_LANES].copy_from_slice(&value.to_array());
+                value += step;
+            }
         }
     }
 
@@ -703,8 +765,14 @@ mod tests {
             None,
             air_min_y,
             corner_columns,
-            |x, y, z, density, _, _| {
-                visits.push(((x, y, z), density.to_bits()));
+            |column, _| {
+                for y_in_cell in (0..N::Settings::CELL_HEIGHT).rev() {
+                    let density = column.densities[y_in_cell as usize];
+                    visits.push((
+                        (column.local_x, column.min_y + y_in_cell, column.local_z),
+                        density.to_bits(),
+                    ));
+                }
             },
         );
         visits

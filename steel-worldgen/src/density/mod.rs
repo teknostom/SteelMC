@@ -19,7 +19,7 @@ use crate::random::RandomSplitter;
 pub mod spline_eval;
 pub mod traits;
 
-pub use traits::{ColumnCache, DimensionNoises, NoiseSettings};
+pub use traits::{ColumnCache, ColumnRouter, DimensionNoises, NoiseSettings};
 
 /// Parameters for creating a noise generator.
 ///

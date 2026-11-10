@@ -687,6 +687,11 @@ impl TranspileContext {
         if is_cse_candidate(df) {
             let fp = fingerprint(df);
             if let Some(var) = self.cse_bindings_simd.get(&fp) {
+                // Reuse the value without changing the marker traversal order.
+                if self.interpolated_param_mode {
+                    self.interpolated_param_counter +=
+                        collect_interpolated_inners(df, &input.registry).len();
+                }
                 return quote! { #var };
             }
         }
@@ -775,12 +780,14 @@ impl TranspileContext {
             DensityFunction::BlendDensity(bd) => self.gen_expr_simd(&bd.input, input, is_flat),
 
             DensityFunction::Marker(m) => {
-                // Markers are transparent to SIMD codegen — recurse into the
-                // wrapped function. (`Interpolated` markers in
-                // `interpolated_param_mode` are rewritten by the scalar combine
-                // paths, and the SIMD fill path never runs in
-                // `interpolated_param_mode`, so the marker kind is moot here.)
-                self.gen_expr_simd(&m.wrapped, input, is_flat)
+                if self.interpolated_param_mode && m.kind == MarkerType::Interpolated {
+                    // Gather only the channels the expression reads.
+                    let idx = Literal::usize_unsuffixed(self.interpolated_param_counter);
+                    self.interpolated_param_counter += 1;
+                    quote! { Simd::from_array(std::array::from_fn(|lane| interpolated[lane][#idx])) }
+                } else {
+                    self.gen_expr_simd(&m.wrapped, input, is_flat)
+                }
             }
 
             DensityFunction::BlendedNoise(_) => {
@@ -1195,6 +1202,15 @@ impl TranspileContext {
         is_flat: bool,
     ) -> TokenStream {
         let scalar = self.gen_expr(df, input, is_flat);
+        // The scalar expression reads one lane of each interpolated channel.
+        let (interp_arr_decl, interp_decl) = if self.interpolated_param_mode {
+            (
+                quote! { let __interp_rows = interpolated; },
+                quote! { let interpolated = &__interp_rows[lane]; },
+            )
+        } else {
+            (quote! {}, quote! {})
+        };
         let bv_arr_decl = if self.fill_mode {
             quote! { let __bv_arr = blended_noise_value_v.to_array(); }
         } else {
@@ -1208,11 +1224,13 @@ impl TranspileContext {
         quote! {{
             let __ys_arr = ys.to_array();
             #bv_arr_decl
+            #interp_arr_decl
             let mut __values = [0.0_f32; N];
             for lane in 0..N {
                 #[allow(clippy::cast_possible_truncation)]
                 let y = __ys_arr[lane];
                 #bv_decl
+                #interp_decl
                 __values[lane] = #scalar;
             }
             Simd::from_array(__values)

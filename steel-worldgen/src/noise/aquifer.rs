@@ -10,7 +10,7 @@
 use std::simd::i32x4;
 use std::sync::Arc;
 
-use crate::density::{ColumnCache, DimensionNoises, NoiseSettings};
+use crate::density::{ColumnCache, ColumnRouter, DimensionNoises, NoiseSettings};
 use crate::noise::PreliminarySurfaceStore;
 use steel_math::{clamp, map, map_clamped};
 use steel_registry::{REGISTRY, vanilla_blocks};
@@ -151,6 +151,14 @@ pub enum AquiferResult {
 /// `dy = loc_y - world_y` varies per call.
 ///
 /// `y_anchor = i32::MIN` marks the cache as invalid (forces a refill).
+/// Whether an anchor's 12 neighboring cells share one fluid status.
+#[derive(Clone, Copy)]
+enum AnchorStatus {
+    Unknown,
+    Mixed,
+    Uniform(FluidStatus),
+}
+
 struct AquiferColumnCache {
     world_x: i32,
     world_z: i32,
@@ -163,8 +171,6 @@ struct AquiferColumnCache {
     cell_xz_dist_sq: [i32; 16],
     /// Per-cell index into `location_cache` / `status_cache`.
     cell_idx: [u32; 12],
-    /// The shared status when all 12 cells have the same one.
-    uniform_status: Option<FluidStatus>,
 }
 
 impl Default for AquiferColumnCache {
@@ -176,7 +182,6 @@ impl Default for AquiferColumnCache {
             cell_loc_y: [0; 16],
             cell_xz_dist_sq: [0; 16],
             cell_idx: [0; 12],
-            uniform_status: None,
         }
     }
 }
@@ -190,6 +195,8 @@ pub struct Aquifer<N: DimensionNoises> {
     location_cache: Vec<i64>,
     /// Lazily computed fluid statuses per grid cell.
     status_cache: Vec<Option<FluidStatus>>,
+    /// Per anchor cell, whether its 12-cell neighborhood shares one status.
+    anchor_status: Vec<AnchorStatus>,
     /// Positional random for grid cell jitter.
     splitter: RandomSplitter,
     /// Column cache owned by the aquifer for density function evaluation.
@@ -295,10 +302,15 @@ fn is_deep_dark_region<N: DimensionNoises>(
     y: i32,
     z: i32,
 ) -> bool {
-    cache.ensure(x, z, noises);
+    // Depth is only read when erosion qualifies; both are pure.
+    cache.ensure_router(x, z, ColumnRouter::Erosion, noises);
     let erosion = f64::from(noises.router_erosion(cache, x, y, z));
-    let depth = f64::from(noises.router_depth(cache, x, y, z));
-    erosion < -0.225 && depth > 0.9
+    if erosion < -0.225 {
+        cache.ensure_router(x, z, ColumnRouter::Depth, noises);
+        let depth = f64::from(noises.router_depth(cache, x, y, z));
+        return depth > 0.9;
+    }
+    false
 }
 
 /// Global fluid picker matching vanilla's `NoiseBasedChunkGenerator.createFluidPicker`.
@@ -396,6 +408,7 @@ impl<N: DimensionNoises> Aquifer<N> {
             return Self {
                 location_cache: Vec::new(),
                 status_cache: Vec::new(),
+                anchor_status: Vec::new(),
                 splitter,
                 cache,
                 col_cache: AquiferColumnCache::default(),
@@ -433,6 +446,7 @@ impl<N: DimensionNoises> Aquifer<N> {
         let total = (grid_size_x * grid_size_y * grid_size_z) as usize;
         let location_cache = vec![i64::MAX; total];
         let status_cache = vec![None; total];
+        let anchor_status = vec![AnchorStatus::Unknown; total];
 
         // Compute skip_sampling_above_y from max preliminary surface level.
         // The scan primes the store for the columns `compute_fluid` reuses.
@@ -452,6 +466,7 @@ impl<N: DimensionNoises> Aquifer<N> {
         Self {
             location_cache,
             status_cache,
+            anchor_status,
             splitter,
             cache,
             col_cache: AquiferColumnCache::default(),
@@ -505,40 +520,39 @@ impl<N: DimensionNoises> Aquifer<N> {
         ((y * self.grid_size_z + z) * self.grid_size_x + x) as usize
     }
 
-    /// shared status if every cached neighbor agrees
-    fn uniform_cell_status(&mut self, noises: &N) -> Option<FluidStatus> {
-        let first = self.get_aquifer_status(self.col_cache.cell_idx[0] as usize, noises);
-        for i in 1..self.col_cache.cell_idx.len() {
-            let index = self.col_cache.cell_idx[i] as usize;
+    /// The status shared by all 12 cells around an anchor, if they agree.
+    /// Depends only on the anchor, so it is computed once per anchor.
+    fn anchor_uniform_status(
+        &mut self,
+        noises: &N,
+        x_anchor: i32,
+        y_anchor: i32,
+        z_anchor: i32,
+    ) -> Option<FluidStatus> {
+        let anchor = self.get_index(x_anchor, y_anchor, z_anchor);
+        match self.anchor_status[anchor] {
+            AnchorStatus::Uniform(status) => return Some(status),
+            AnchorStatus::Mixed => return None,
+            AnchorStatus::Unknown => {}
+        }
+
+        let cells = self.anchor_cells(x_anchor, y_anchor, z_anchor);
+        let first = self.get_aquifer_status(cells[0].0, noises);
+        let mut uniform = Some(first);
+        for &(index, _) in &cells[1..] {
             if self.get_aquifer_status(index, noises) != first {
-                return None;
+                uniform = None;
+                break;
             }
         }
-
-        Some(first)
+        self.anchor_status[anchor] = uniform.map_or(AnchorStatus::Mixed, AnchorStatus::Uniform);
+        uniform
     }
 
-    /// Whether `fluid_at` is water directly above the global lava sea.
-    fn is_water_over_global_lava(&self, fluid_at: Option<BlockStateId>, world_y: i32) -> bool {
-        if fluid_at != Some(self.water_id) {
-            return false;
-        }
-        let below = global_fluid(
-            world_y - 1,
-            self.lava_floor,
-            self.sea_level,
-            self.lava_id,
-            self.default_fluid_id,
-        );
-        below.fluid_type == self.lava_id && (world_y - 1) < below.fluid_level
-    }
-
-    /// refill in x/y/z order to keep nearest-cell ties unchanged
-    fn refill_col_cache(&mut self, world_x: i32, world_y: i32, world_z: i32) -> i32 {
-        let x_anchor = grid_x(world_x + SAMPLE_OFFSET_X);
-        let y_anchor = grid_y(world_y + SAMPLE_OFFSET_Y);
-        let z_anchor = grid_z(world_z + SAMPLE_OFFSET_Z);
-
+    /// Grid index and packed center of the 12 cells around an anchor, in
+    /// x/y/z order to keep nearest-cell ties unchanged.
+    fn anchor_cells(&mut self, x_anchor: i32, y_anchor: i32, z_anchor: i32) -> [(usize, i64); 12] {
+        let mut cells = [(0, 0); 12];
         let mut i = 0;
         for x1 in 0..=1i32 {
             for y1 in -1..=1i32 {
@@ -561,24 +575,53 @@ impl<N: DimensionNoises> Aquifer<N> {
                     } else {
                         loc
                     };
-
-                    let dx = unpack_x(loc) - world_x;
-                    let dz = unpack_z(loc) - world_z;
-                    self.col_cache.cell_loc_y[i] = unpack_y(loc);
-                    self.col_cache.cell_xz_dist_sq[i] = dx * dx + dz * dz;
-                    self.col_cache.cell_idx[i] = idx as u32;
+                    cells[i] = (idx, loc);
                     i += 1;
                 }
             }
+        }
+        cells
+    }
+
+    /// Whether `fluid_at` is water directly above the global lava sea.
+    fn is_water_over_global_lava(&self, fluid_at: Option<BlockStateId>, world_y: i32) -> bool {
+        if fluid_at != Some(self.water_id) {
+            return false;
+        }
+        let below = global_fluid(
+            world_y - 1,
+            self.lava_floor,
+            self.sea_level,
+            self.lava_id,
+            self.default_fluid_id,
+        );
+        below.fluid_type == self.lava_id && (world_y - 1) < below.fluid_level
+    }
+
+    fn refill_col_cache(&mut self, world_x: i32, world_y: i32, world_z: i32) {
+        let x_anchor = grid_x(world_x + SAMPLE_OFFSET_X);
+        let y_anchor = grid_y(world_y + SAMPLE_OFFSET_Y);
+        let z_anchor = grid_z(world_z + SAMPLE_OFFSET_Z);
+
+        for (i, (idx, loc)) in self
+            .anchor_cells(x_anchor, y_anchor, z_anchor)
+            .into_iter()
+            .enumerate()
+        {
+            let dx = unpack_x(loc) - world_x;
+            let dz = unpack_z(loc) - world_z;
+            self.col_cache.cell_loc_y[i] = unpack_y(loc);
+            self.col_cache.cell_xz_dist_sq[i] = dx * dx + dz * dz;
+            self.col_cache.cell_idx[i] = idx as u32;
         }
 
         self.col_cache.world_x = world_x;
         self.col_cache.world_z = world_z;
         self.col_cache.y_anchor = y_anchor;
-        y_anchor
     }
 
     /// Compute what block to place at this position given the interpolated density.
+    #[inline]
     pub fn compute_substance(
         &mut self,
         noises: &N,
@@ -592,7 +635,17 @@ impl<N: DimensionNoises> Aquifer<N> {
             self.should_schedule_fluid_update = false;
             return AquiferResult::Solid;
         }
+        self.compute_non_solid_substance(noises, world_x, world_y, world_z, density)
+    }
 
+    fn compute_non_solid_substance(
+        &mut self,
+        noises: &N,
+        world_x: i32,
+        world_y: i32,
+        world_z: i32,
+        density: f64,
+    ) -> AquiferResult {
         // Disabled aquifers (nether/end): use global fluid picker directly,
         // matching vanilla's `Aquifer.createDisabled`.
         if !N::Settings::AQUIFERS_ENABLED {
@@ -638,17 +691,15 @@ impl<N: DimensionNoises> Aquifer<N> {
         // are constant for a given `y_anchor`; only `dy` varies. The column
         // cache amortizes location lookup, splitter calls, and i64 unpacking.
         let y_anchor = grid_y(world_y + SAMPLE_OFFSET_Y);
-        if self.col_cache.world_x != world_x
-            || self.col_cache.world_z != world_z
-            || self.col_cache.y_anchor != y_anchor
-        {
-            self.refill_col_cache(world_x, world_y, world_z);
-            self.col_cache.uniform_status = self.uniform_cell_status(noises);
-        }
 
         // equal statuses mean zero pressure and no fluid update
         // water over global lava still needs the full path
-        if let Some(status) = self.col_cache.uniform_status {
+        if let Some(status) = self.anchor_uniform_status(
+            noises,
+            grid_x(world_x + SAMPLE_OFFSET_X),
+            y_anchor,
+            grid_z(world_z + SAMPLE_OFFSET_Z),
+        ) {
             let fluid_at = status.at(world_y);
             if !self.is_water_over_global_lava(fluid_at, world_y) {
                 self.should_schedule_fluid_update = false;
@@ -657,6 +708,13 @@ impl<N: DimensionNoises> Aquifer<N> {
                     None => AquiferResult::Air,
                 };
             }
+        }
+
+        if self.col_cache.world_x != world_x
+            || self.col_cache.world_z != world_z
+            || self.col_cache.y_anchor != y_anchor
+        {
+            self.refill_col_cache(world_x, world_y, world_z);
         }
 
         self.compute_substance_sampled(noises, world_x, world_y, world_z, density)
@@ -1127,7 +1185,7 @@ pub fn preliminary_surface_level<N: DimensionNoises>(
     // Quantize to quart positions: (x >> 2) << 2
     let qx = (x >> 2) << 2;
     let qz = (z >> 2) << 2;
-    cache.ensure(qx, qz, noises);
+    cache.ensure_router(qx, qz, ColumnRouter::PreliminarySurfaceLevel, noises);
     // Vanilla uses Mth.floor(), not truncation
     noises
         .router_preliminary_surface_level(cache, qx, 0, qz)
@@ -1140,7 +1198,10 @@ mod tests {
 
     use steel_utils::random::{Random, xoroshiro::Xoroshiro};
 
-    use super::{Aquifer, AquiferResult, SAMPLE_OFFSET_Y, grid_y};
+    use super::{
+        Aquifer, AquiferResult, SAMPLE_OFFSET_X, SAMPLE_OFFSET_Y, SAMPLE_OFFSET_Z, global_fluid,
+        grid_x, grid_y, grid_z,
+    };
     use crate::density::DimensionNoises;
     use crate::density_functions::overworld::OverworldNoises;
     use crate::noise::PreliminarySurfaceStore;
@@ -1186,14 +1247,31 @@ mod tests {
                         for density in [-0.3, -0.004] {
                             let result = aquifer.compute_substance(&noises, x, y, z, density);
                             let flag = aquifer.should_schedule_fluid_update();
-                            let cache = &aquifer.col_cache;
-                            let current = cache.world_x == x
-                                && cache.world_z == z
-                                && cache.y_anchor == grid_y(y + SAMPLE_OFFSET_Y);
-                            if !current || cache.uniform_status.is_none() {
+                            // Only blocks that reach the shortcut: below the skip
+                            // height and outside the global lava sea.
+                            let gf = global_fluid(
+                                y,
+                                aquifer.lava_floor,
+                                aquifer.sea_level,
+                                aquifer.lava_id,
+                                aquifer.default_fluid_id,
+                            );
+                            if y > aquifer.skip_sampling_above_y
+                                || (gf.fluid_type == aquifer.lava_id && y < gf.fluid_level)
+                            {
+                                continue;
+                            }
+                            let uniform = aquifer.anchor_uniform_status(
+                                &noises,
+                                grid_x(x + SAMPLE_OFFSET_X),
+                                grid_y(y + SAMPLE_OFFSET_Y),
+                                grid_z(z + SAMPLE_OFFSET_Z),
+                            );
+                            if uniform.is_none() {
                                 continue;
                             }
                             shortcut += 1;
+                            aquifer.refill_col_cache(x, y, z);
                             let sampled =
                                 aquifer.compute_substance_sampled(&noises, x, y, z, density);
                             assert_eq!(

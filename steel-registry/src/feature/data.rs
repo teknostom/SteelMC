@@ -712,6 +712,8 @@ pub struct OreConfiguration {
     pub targets: Vec<OreTarget>,
     pub size: i32,
     pub discard_chance_on_air_exposure: f32,
+    /// Lazily resolved [`Self::targets`]; see [`Self::resolved_targets`].
+    pub resolved_targets: std::sync::OnceLock<super::ResolvedOreTargets>,
 }
 
 #[derive(Debug, Clone)]

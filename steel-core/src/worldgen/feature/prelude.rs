@@ -31,7 +31,6 @@ pub(super) use steel_registry::feature::{
     UpwardsBranchingTrunkPlacer, VegetationPatchConfiguration, VerticalSurface,
 };
 pub(super) use steel_registry::fluid::{FluidRef, FluidState, FluidStateExt as _};
-pub(super) use steel_registry::structure_processor::StructureRuleTestData;
 pub(super) use steel_registry::{
     REGISTRY, Registry, RegistryEntry as _, RegistryExt as _, TaggedRegistryExt as _,
     vanilla_blocks, vanilla_fluids,

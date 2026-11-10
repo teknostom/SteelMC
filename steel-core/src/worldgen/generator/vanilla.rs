@@ -496,13 +496,17 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
 
         let material_values = Arc::make_mut(&mut material_ore_vein_values);
         let mut material_cache = N::ColumnCache::default();
+        let cell_height = N::Settings::CELL_HEIGHT as usize;
+        let interp_count = N::interpolated_count();
         noise_chunk.fill(
             noises,
             &mut column_cache,
             beardifier,
             unsampled_air_min_y,
             &self.corner_columns,
-            |local_x, world_y, local_z, density, interpolated, _| {
+            |column, _| {
+                let (local_x, local_z) = (column.local_x, column.local_z);
+                let (world_x, world_z) = (column.world_x, column.world_z);
                 // Flush when we move to a new column
                 if local_x != prev_x || local_z != prev_z {
                     if !pending_writes.is_empty() {
@@ -515,64 +519,64 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                     world_surface_complete = false;
                 }
 
-                let relative_y = (world_y - min_y) as usize;
-                let world_x = chunk_min_x + local_x as i32;
-                let world_z = chunk_min_z + local_z as i32;
-
-                if material_value_count != 0 && relative_y < material_value_height {
-                    let offset =
-                        (relative_y * 16 * 16 + local_z * 16 + local_x) * material_value_count;
-                    noises.fill_material_ore_vein_values(
-                        &mut material_cache,
-                        interpolated,
+                let cell_relative_y = (column.min_y - min_y) as usize;
+                for y_in_cell in (0..cell_height).rev() {
+                    let world_y = column.min_y + y_in_cell as i32;
+                    let relative_y = cell_relative_y + y_in_cell;
+                    if material_value_count != 0 && relative_y < material_value_height {
+                        let offset =
+                            (relative_y * 16 * 16 + local_z * 16 + local_x) * material_value_count;
+                        noises.fill_material_ore_vein_values(
+                            &mut material_cache,
+                            &column.interpolated[y_in_cell][..interp_count],
+                            world_x,
+                            world_y,
+                            world_z,
+                            &mut material_values[offset..offset + material_value_count],
+                        );
+                    }
+                    let substance = aquifer.compute_substance(
+                        noises,
                         world_x,
                         world_y,
                         world_z,
-                        &mut material_values[offset..offset + material_value_count],
+                        f64::from(column.densities[y_in_cell]),
                     );
-                }
-
-                let substance = aquifer.compute_substance(
-                    noises,
-                    world_x,
-                    world_y,
-                    world_z,
-                    f64::from(density),
-                );
-                match substance {
-                    AquiferResult::Solid => {
-                        pending_writes.push((relative_y, default_block_id));
-                        ocean_floor_complete = ocean_floor_complete
-                            || ocean_floor_wg.update_for_initial_fill(
-                                local_x,
-                                world_y,
-                                local_z,
-                                default_block_id,
-                            );
-                        world_surface_complete = world_surface_complete
-                            || world_surface_wg.update_for_initial_fill(
-                                local_x,
-                                world_y,
-                                local_z,
-                                default_block_id,
-                            );
-                    }
-                    AquiferResult::Fluid(id) => {
-                        pending_writes.push((relative_y, id));
-                        ocean_floor_complete = ocean_floor_complete
-                            || ocean_floor_wg
-                                .update_for_initial_fill(local_x, world_y, local_z, id);
-                        world_surface_complete = world_surface_complete
-                            || world_surface_wg
-                                .update_for_initial_fill(local_x, world_y, local_z, id);
-
-                        if aquifer.should_schedule_fluid_update() && id.has_fluid() {
-                            chunk.mark_pos_for_postprocessing(BlockPos::new(
-                                world_x, world_y, world_z,
-                            ));
+                    match substance {
+                        AquiferResult::Solid => {
+                            pending_writes.push((relative_y, default_block_id));
+                            ocean_floor_complete = ocean_floor_complete
+                                || ocean_floor_wg.update_for_initial_fill(
+                                    local_x,
+                                    world_y,
+                                    local_z,
+                                    default_block_id,
+                                );
+                            world_surface_complete = world_surface_complete
+                                || world_surface_wg.update_for_initial_fill(
+                                    local_x,
+                                    world_y,
+                                    local_z,
+                                    default_block_id,
+                                );
                         }
+                        AquiferResult::Fluid(id) => {
+                            pending_writes.push((relative_y, id));
+                            ocean_floor_complete = ocean_floor_complete
+                                || ocean_floor_wg
+                                    .update_for_initial_fill(local_x, world_y, local_z, id);
+                            world_surface_complete = world_surface_complete
+                                || world_surface_wg
+                                    .update_for_initial_fill(local_x, world_y, local_z, id);
+
+                            if aquifer.should_schedule_fluid_update() && id.has_fluid() {
+                                chunk.mark_pos_for_postprocessing(BlockPos::new(
+                                    world_x, world_y, world_z,
+                                ));
+                            }
+                        }
+                        AquiferResult::Air => {}
                     }
-                    AquiferResult::Air => {}
                 }
             },
         );

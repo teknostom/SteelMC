@@ -14,12 +14,17 @@ use crate::density::DensityFunction;
 
 use super::TranspilerInput;
 use super::context::TranspileContext;
-use super::graph::{collect_interpolated_inners, is_flat_cached, unwrap_markers};
+use super::graph::{
+    collect_interpolated_inners, is_flat_cached, reads_blended_noise_at_y, unwrap_markers,
+};
 use super::naming::{
     named_fn_ident, named_fn_ident_simd, router_cache_field_ident, router_compute_fn_ident,
     sanitize_name,
 };
 use super::nonpositive::final_density_nonpositive_channels;
+
+/// Corner Ys scanned on each side of 0 for blended noise reads.
+const BLENDED_SCAN: i32 = 4096;
 
 const AQUIFER_ROUTERS: [&str; 4] = [
     "barrier",
@@ -232,6 +237,26 @@ impl TranspileContext {
         let total_count = all_inners.len();
         let total_count_lit = Literal::usize_unsuffixed(total_count);
 
+        // Corner Ys whose channels can read the blended noise, as a hull. Ys
+        // past the scan are covered by the clamped gradients' end values.
+        let cell_height = input.cell_height;
+        let reading_ys: Vec<i32> = (-BLENDED_SCAN / cell_height..=BLENDED_SCAN / cell_height)
+            .map(|i| i * cell_height)
+            .filter(|&y| {
+                all_inners
+                    .iter()
+                    .any(|inner| reads_blended_noise_at_y(inner, &input.registry, y))
+            })
+            .collect();
+        let blended_y_range =
+            if let (Some(&lo), Some(&hi)) = (reading_ys.first(), reading_ys.last()) {
+                let lo = if lo <= -BLENDED_SCAN { i32::MIN } else { lo };
+                let hi = if hi >= BLENDED_SCAN { i32::MAX } else { hi };
+                quote! { (#lo, #hi) }
+            } else {
+                quote! { (1, 0) }
+            };
+
         // Phase 2: Generate fill_cell_corner_densities with all channels.
         self.fill_mode = true;
         let mut inner_stmts = Vec::with_capacity(total_count);
@@ -270,6 +295,16 @@ impl TranspileContext {
             quote! { 0.0 }
         };
         let combine_fd_splines = mem::take(&mut self.spline_fns);
+        let combine_fd_body_simd = if let Some(info) = entries.get("final_density") {
+            self.interpolated_param_mode = true;
+            self.interpolated_param_counter = info.start;
+            let body = self.gen_expr_simd(&info.df, input, false);
+            self.interpolated_param_mode = false;
+            body
+        } else {
+            quote! { Simd::<f32, N>::splat(0.0) }
+        };
+        let combine_fd_splines_simd = mem::take(&mut self.spline_fns);
         let nonpositive_channels = entries
             .get("final_density")
             .and_then(|info| {
@@ -356,6 +391,10 @@ impl TranspileContext {
             /// router entries (final_density + vein_toggle + vein_ridged).
             pub const INTERPOLATED_COUNT: usize = #total_count_lit;
 
+            /// Inclusive range of cell-corner Ys at which a channel can read the
+            /// blended noise; empty when none does.
+            pub const BLENDED_NOISE_CORNER_Y_RANGE: (i32, i32) = #blended_y_range;
+
             /// Whether vein functions have interpolation channels.
             pub const VEIN_INTERP_ENABLED: bool = #has_vein_interp_tok;
 
@@ -417,6 +456,22 @@ impl TranspileContext {
                 #combine_fd_body
             }
 
+            /// SIMD form of [`combine_interpolated`] for `N` Y values of one
+            /// column; `interpolated[lane]` holds that Y's channels.
+            #[expect(unused_variables, reason = "generated function has a fixed signature; not all parameters are used in every dimension")]
+            #[inline]
+            pub fn combine_interpolated_y_simd<const N: usize, const W: usize>(
+                noises: &#noises,
+                cache: &#cache,
+                interpolated: &[[f32; W]; N],
+                ys: [i32; N],
+            ) -> [f32; N] {
+                let x = cache.x as f64;
+                let z = cache.z as f64;
+                let ys = Simd::from_array(ys.map(f64::from));
+                (#combine_fd_body_simd).to_array()
+            }
+
             /// Combine interpolated values for `vein_toggle`.
             #[expect(unused_variables, reason = "generated function has a fixed signature; not all parameters are used in every dimension")]
             pub fn combine_vein_toggle(
@@ -452,6 +507,7 @@ impl TranspileContext {
             #(#fill_spline_fns)*
             #(#fill_spline_fns_simd)*
             #(#combine_fd_splines)*
+            #(#combine_fd_splines_simd)*
             #(#combine_vein_toggle_splines)*
             #(#combine_vein_ridged_splines)*
             #(#material_combine_fns)*
